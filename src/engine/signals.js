@@ -4,9 +4,9 @@
 import { vsaSignals } from "../indicators/vsa";
 
 /**
- * Build per-row boolean/series signals used by scoring.
+ * Build per-row boolean/series signals used by scoring and chart display.
  * @param {Array<{ts:number,open:number,high:number,low:number,close:number,volume:number}>} rows
- * @param {{ 
+ * @param {{
  *   dBBlowerRow:number[], dRSIRow:number[], dMACDRow:number[], dMACDSigRow:number[], dMACDCrossRow:boolean[],
  *   dSMA7Row:number[], dSMA30Row:number[], dSMA90Row:number[],
  *   dSmaStackRow:boolean[], dPrev30LowUpRow:boolean[],
@@ -27,7 +27,7 @@ export function buildSignals(rows, dailyToRow){
   const sma30Row     = dailyToRow.dSMA30Row;
   const sma90Row     = dailyToRow.dSMA90Row;
   const smaStack     = dailyToRow.dSmaStackRow.map(Boolean);
-  const prev30LowUp  = dailyToRow.dPrev30LowUpRow.map(Boolean);
+  const prevLowUp    = dailyToRow.dPrev30LowUpRow.map(Boolean);
   const piBuy        = dailyToRow.dPiBuyRow;           // absolute
   const piRatioRow   = dailyToRow.dPiRatioRow;
   const mvrvzBuy     = dailyToRow.rMvrvBuyRow;         // absolute
@@ -39,10 +39,26 @@ export function buildSignals(rows, dailyToRow){
   const open = rows.map(r=>r.open), high = rows.map(r=>r.high), low = rows.map(r=>r.low), vol = rows.map(r=>r.volume);
   const vsaC = vsaSignals(open, high, low, rows.map(r=>r.close), vol).combined;
 
-  // Expose the context needed by scoring (windowing is done in the caller)
   return {
-    series: { bbLowerRow, rsiRow, macdRow, macdSigRow, macdCross, sma7Row, sma30Row, sma90Row, smaStack, prev30LowUp },
-    absolutes: { piBuy, mvrvzBuy },
-    features: { touchLower, vsaC, piRatioRow }
+    series: {
+      rsi: rsiRow,
+      macd: macdRow,
+      macdSig: macdSigRow,
+      macdCross,
+      sma7: sma7Row,
+      sma30: sma30Row,
+      sma90: sma90Row,
+      smaStack,
+      prevLowUp,
+    },
+    features: {
+      touchLower,
+      vsa: vsaC,
+      piRatio: piRatioRow,
+    },
+    absolutes: {
+      piBuy,
+      mvrvzBuy,
+    },
   };
 }

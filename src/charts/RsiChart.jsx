@@ -8,130 +8,71 @@ import {
   CartesianGrid,
   Tooltip,
   ReferenceLine,
-  ReferenceArea,
   ResponsiveContainer,
 } from "recharts";
 
-/**
- * RsiChart
- * - Renders RSI (0-100) on the 4h axis
- * - Draws BUY markers robustly (unit-normalised, axisId-aligned)
- *
- * Props:
- *  - data: Array<{ ts4h:number, rsi:number }>
- *  - buys: number[]   // timestamps (sec or ms; 1h or 4h) - we normalise below
- *  - syncId?: string
- *  - height?: number
- *  - xId?: string     // default 'time'
- */
-export default function RsiChart({
-  data,
-  buys,
-  syncId = "sync-confidence",
-  height = 160,
-  xId = "time",
-}){
-  const xKey = "ts4h";
+const FOUR_H_MS = 4 * 60 * 60 * 1000;
+const TEN_BILLION = 10_000_000_000;
 
-  const toMs  = (v) => (v && v < 10_000_000_000 ? v * 1000 : v);
-  const toSec = (v) => (v && v > 10_000_000_000 ? Math.floor(v / 1000) : v);
-  const FOUR_H_MS = 4 * 60 * 60 * 1000;
+const toMs = (v) => (v && v < TEN_BILLION ? v * 1000 : v);
+const toSec = (v) => (v && v > TEN_BILLION ? Math.floor(v / 1000) : v);
 
+export default function RsiChart({ data = [], buyLines = [], syncId, height = 160 }){
   const axisLooksLikeSeconds = useMemo(()=>{
-    const s = data && data.length ? data[0]?.[xKey] : null;
-    return s && s < 10_000_000_000;
+    const first = data && data.length ? data[0]?.ts : null;
+    return first && first < TEN_BILLION;
   }, [data]);
 
-  const is4hKey = true;
-
   const buyXs = useMemo(()=>{
-    if (!Array.isArray(buys) || !Array.isArray(data) || !data.length) return [];
+    if (!Array.isArray(buyLines)) return [];
     const convert = axisLooksLikeSeconds ? toSec : toMs;
-    const snap4h = (t) => Math.floor(t / FOUR_H_MS) * FOUR_H_MS;
-    return buys
+    return buyLines
       .filter(Number.isFinite)
       .map(convert)
-      .map((t) => (is4hKey ? (axisLooksLikeSeconds ? toSec(snap4h(toMs(t))) : snap4h(t)) : t));
-  }, [buys, data, axisLooksLikeSeconds]);
-
-  const firstX = data && data.length ? data[0]?.[xKey] : null;
-  const lastX  = data && data.length ? data[data.length-1]?.[xKey] : null;
-
-  const buyXsClean = useMemo(()=>{
-    const set = new Set(buyXs.filter((x)=> Number.isFinite(x)));
-    return Array.from(set).sort((a,b)=>a-b);
-  }, [buyXs]);
-
-  const renderBuyMarkers = () => {
-    if (!buyXsClean.length || !Number.isFinite(firstX) || !Number.isFinite(lastX)) return null;
-    const halfWidth = axisLooksLikeSeconds ? 15 * 60 : 15 * 60 * 1000; // 15 minutes in axis units
-
-    return buyXsClean.map((x,i)=>{
-      const atEdge = (x <= firstX) || (x >= lastX);
-      if (atEdge){
-        return (
-          <ReferenceArea
-            key={"rsi-buy-area-"+x+"-"+i}
-            xAxisId={xId}
-            x1={x - halfWidth}
-            x2={x + halfWidth}
-            ifOverflow="visible"
-            fill="rgba(0,128,0,0.25)"
-            strokeOpacity={0}
-          />
-        );
-      }
-      return (
-        <ReferenceLine
-          key={"rsi-buy-line-"+x+"-"+i}
-          xAxisId={xId}
-          x={x}
-          ifOverflow="visible"
-          isFront
-          stroke="green"
-          strokeDasharray="6 4"
-        />
-      );
-    });
-  };
+      .map((t)=> {
+        const snapped = Math.floor(toMs(t) / FOUR_H_MS) * FOUR_H_MS;
+        return axisLooksLikeSeconds ? toSec(snapped) : snapped;
+      });
+  }, [buyLines, axisLooksLikeSeconds]);
 
   return (
-    <ResponsiveContainer width="100%" height={height}>
-      <LineChart data={data} syncId={syncId}>
-        <CartesianGrid strokeDasharray="3 3" />
-        <XAxis
-          type="number"
-          dataKey={xKey}
-          xAxisId={xId}
-          domain={["dataMin","dataMax"]}
-          allowDataOverflow
-        />
-        <YAxis
-          domain={[0, 100]}
-          tickCount={6}
-          allowDataOverflow
-        />
-        <Tooltip
-          labelFormatter={(v)=> new Date(axisLooksLikeSeconds ? v*1000 : v).toISOString().replace(".000Z","Z")}
-          formatter={(val, name)=> [Number.isFinite(val) ? val : val, name]}
-        />
-
-        {/* RSI */}
-        <Line
-          type="monotone"
-          dataKey="rsi"
-          stroke="#8884d8"
-          dot={false}
-          isAnimationActive={false}
-        />
-
-        {/* RSI guide lines */}
-        <ReferenceLine y={30} stroke="#cccccc" strokeDasharray="4 3" />
-        <ReferenceLine y={70} stroke="#cccccc" strokeDasharray="4 3" />
-
-        {/* BUY markers */}
-        {renderBuyMarkers()}
-      </LineChart>
-    </ResponsiveContainer>
+    <div className="h-[160px] mb-3">
+      <ResponsiveContainer width="100%" height={height}>
+        <LineChart data={data} margin={{ top: 5, right: 20, left: 10, bottom: 5 }} syncId={syncId}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis
+            type="number"
+            dataKey="ts"
+            domain={["dataMin", "dataMax"]}
+            minTickGap={16}
+            tickFormatter={(v)=>{
+              const ms = axisLooksLikeSeconds ? v * 1000 : v;
+              const d = new Date(ms);
+              return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`;
+            }}
+          />
+          <YAxis domain={[0, 100]} />
+          <ReferenceLine y={30} stroke="#9ca3af" strokeDasharray="3 3" ifOverflow="clip" />
+          <ReferenceLine y={70} stroke="#9ca3af" strokeDasharray="3 3" ifOverflow="clip" />
+          <Tooltip
+            formatter={(v)=> [typeof v === "number" ? Number(v).toFixed(2) : v, "RSI (14d)"]}
+            labelFormatter={(l)=>{
+              const ms = axisLooksLikeSeconds ? l * 1000 : l;
+              return new Date(ms).toISOString().replace("T", " ").slice(0, 16);
+            }}
+          />
+          <Line type="monotone" dataKey="rsi" name="RSI (14d)" dot={false} strokeWidth={1.5} />
+          {buyXs.map((ts, i)=>(
+            <ReferenceLine
+              key={`rsi-buy-${ts}-${i}`}
+              x={ts}
+              stroke="green"
+              strokeDasharray="6 4"
+              ifOverflow="extendDomain"
+            />
+          ))}
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
   );
 }

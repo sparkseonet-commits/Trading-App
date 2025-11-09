@@ -1,71 +1,48 @@
 // src/charts/BuyTable.jsx
 import React from "react";
 
-/**
- * BuyTable
- * - Simple presentational table showing detected BUY events.
- *
- * Props:
- *  - buys: Array<{ ts:number, confidence?:number, parts?:Record<string,number> }>
- *  - title?: string
- *  - maxRows?: number   // show only the most recent N
- */
-export default function BuyTable({ buys = [], title = "Buy Signals", maxRows = 50 }){
-  const fmtISO = (t)=> {
-    if (!Number.isFinite(t)) return "";
-    const ms = t < 10_000_000_000 ? t * 1000 : t;
-    return new Date(ms).toISOString().replace(".000Z","Z");
-  };
+const formatParts = (parts) => {
+  if (!parts || typeof parts !== "object") return null;
+  return Object.entries(parts)
+    .filter(([, v])=> Number(v) > 0)
+    .map(([k, v])=> `${k}: ${Number(v).toFixed(2)}`);
+};
 
-  const rows = Array.isArray(buys) ? [...buys].sort((a,b)=> (a.ts - b.ts)).slice(-maxRows).reverse() : [];
+export default function BuyTable({ buys = [], formatDate }){
+  if (!Array.isArray(buys) || buys.length === 0) {
+    return <div className="text-gray-500 text-sm">No buys detected in the current window.</div>;
+  }
 
   return (
-    <div className="buy-table">
-      <h3 style={{ margin: "8px 0" }}>{title}</h3>
-      <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr>
-              <th style={th}>#</th>
-              <th style={th}>Time (UTC)</th>
-              <th style={th}>Confidence</th>
-              <th style={th}>Parts</th>
+    <div className="overflow-x-auto">
+      <table className="min-w-full text-sm">
+        <thead>
+          <tr className="text-left border-b">
+            <th className="py-2 pr-4">Date (1h)</th>
+            <th className="py-2 pr-4">Confidence</th>
+            <th className="py-2 pr-4">Contributors</th>
+          </tr>
+        </thead>
+        <tbody>
+          {buys.map((b, idx)=>(
+            <tr key={`${b.ts}-${idx}`} className="border-b hover:bg-gray-50">
+              <td className="py-2 pr-4 whitespace-nowrap">{formatDate ? formatDate(b.ts) : b.ts}</td>
+              <td className="py-2 pr-4">{Number.isFinite(b.conf) ? Number(b.conf).toFixed(2) : (Number.isFinite(b.confidence) ? Number(b.confidence).toFixed(2) : "")}</td>
+              <td className="py-2 pr-4">
+                {b.parts ? (
+                  <div className="flex flex-wrap gap-2">
+                    {formatParts(b.parts)?.map((text)=>(
+                      <span key={`${b.ts}-${text}`} className="px-2 py-1 rounded-full bg-green-100 text-green-700">{text}</span>
+                    ))}
+                  </div>
+                ) : (
+                  <span className="text-gray-500">Absolute</span>
+                )}
+              </td>
             </tr>
-          </thead>
-          <tbody>
-            {rows.map((b, i)=>{
-              const conf = Number.isFinite(b.confidence) ? b.confidence.toFixed(2) : "";
-              const parts = b.parts && typeof b.parts === "object"
-                ? Object.entries(b.parts).filter(([k,v])=> v>0).map(([k,v])=> `${k}:${v}`).join(", ")
-                : "";
-              return (
-                <tr key={b.ts + "-" + i}>
-                  <td style={td}>{i+1}</td>
-                  <td style={td}>{fmtISO(b.ts)}</td>
-                  <td style={td}>{conf}</td>
-                  <td style={td}>{parts}</td>
-                </tr>
-              );
-            })}
-            {!rows.length && (
-              <tr><td colSpan={4} style={td}>No buys in view.</td></tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
-
-const th = {
-  textAlign: "left",
-  borderBottom: "1px solid #ddd",
-  padding: "6px 8px",
-  whiteSpace: "nowrap",
-};
-
-const td = {
-  borderBottom: "1px solid #f0f0f0",
-  padding: "6px 8px",
-  fontSize: 13,
-};
