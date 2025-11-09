@@ -101,6 +101,37 @@ const std = (arr: number[], period: number): number[] => {
   return out;
 };
 
+const atr = (high: number[], low: number[], close: number[], period: number): number[] => {
+  const n = close.length; const out = new Array(n).fill(NaN);
+  if (period <= 0 || n === 0) return out;
+  let prevClose = Number.isFinite(close[0]) ? close[0] : NaN;
+  let running = 0; let seeded = false; let prevAtr = NaN;
+  for (let i=0;i<n;i++){
+    const hi = Number.isFinite(high[i]) ? high[i] : NaN;
+    const lo = Number.isFinite(low[i]) ? low[i] : NaN;
+    const cl = Number.isFinite(close[i]) ? close[i] : prevClose;
+    if (!Number.isFinite(hi) || !Number.isFinite(lo)) {
+      if (Number.isFinite(cl)) prevClose = cl;
+      continue;
+    }
+    const trBase = hi - lo;
+    const trHigh = Number.isFinite(prevClose) ? Math.abs(hi - prevClose) : trBase;
+    const trLow  = Number.isFinite(prevClose) ? Math.abs(lo - prevClose) : trBase;
+    const tr = Math.max(trBase, trHigh, trLow);
+    if (!seeded){
+      running += tr;
+      const denom = i + 1;
+      out[i] = denom > 0 ? running / denom : NaN;
+      if (i + 1 >= period){ seeded = true; prevAtr = out[i]; }
+    } else {
+      prevAtr = Number.isFinite(prevAtr) ? ((prevAtr * (period - 1)) + tr) / period : tr;
+      out[i] = prevAtr;
+    }
+    if (Number.isFinite(cl)) prevClose = cl;
+  }
+  return out;
+};
+
 // Wilder RSI (14 by default)
 const rsi = (arr: number[], period: number): number[] => {
   const n = arr.length; const out = new Array(n).fill(NaN);
@@ -148,26 +179,159 @@ function slope(arr: number[], window=10){
   return out;
 }
 
-// ---------------- VSA (simplified) ----------------
-function vsaSignals(open: number[], high: number[], low: number[], close: number[], volume: number[]){
-  const n = close.length; const out = { combined: new Array(n).fill(0) } as { combined: number[] };
-  const volMA = sma(volume, 24); // 24h lookback
- // 20h proxy
-  const volSD = std(volume, 24);
-  for (let i=1;i<n;i++){
-    const rng = high[i]-low[i]; if (!Number.isFinite(rng) || rng<=0) { out.combined[i]=0; continue; }
-    const body = Math.abs(close[i] - (open[i] ?? close[i-1]));
-    const mid = low[i] + rng/2; const isDown = close[i] < (open[i] ?? close[i-1]); const isUp = close[i] > (open[i] ?? close[i-1]);
-    const longLower = (close[i]-low[i]) > 0.6*rng; const narrow = body/rng < 0.35;
-    const hv = Number.isFinite(volMA[i]) ? volume[i] > (volMA[i] + (volSD[i]||0)) : false;
-    const lv = Number.isFinite(volMA[i]) ? volume[i] < (volMA[i]*0.7) : false;
-    const stopping = isDown && hv && close[i]>=mid;
-    const noSupply = isDown && lv && narrow && (close[i] <= low[i]+0.25*rng);
-    const testBar = narrow && lv && (close[i] >= low[i] + 0.75*rng) && (close[i-1] < (open[i-1] ?? close[i-2] ?? close[i-1]));
-    const shakeout = hv && longLower && isUp;
-    out.combined[i] = (stopping||noSupply||testBar||shakeout) ? 1 : 0;
+// ---------------- VSA (enriched) ----------------
+const VSA_WINDOW = 24;
+const VSA_ACTIVATION = 2.6;
+const VSA_WEIGHTS = {
+  stopping: 1.6,
+  noSupply: 1.1,
+  testBar: 1.4,
+  shakeout: 2.2,
+  climactic: 2.0,
+  spring: 2.6,
+  demand: 1.7,
+  effortResult: 1.2,
+} as const;
+
+type VsaComponents = {
+  stopping: number[];
+  noSupply: number[];
+  testBar: number[];
+  shakeout: number[];
+  climactic: number[];
+  spring: number[];
+  demand: number[];
+  effortResult: number[];
+};
+
+type VsaContext = {
+  volumeMA: number[];
+  volumeSD: number[];
+  volumeZ: number[];
+  atr: number[];
+};
+
+type VsaResult = {
+  combined: number[];
+  score: number[];
+  components: VsaComponents;
+  context: VsaContext;
+  meta: { weights: typeof VSA_WEIGHTS; activation: number };
+};
+
+function vsaSignals(open: number[], high: number[], low: number[], close: number[], volume: number[]): VsaResult {
+  const n = close.length;
+  const combined = new Array(n).fill(0);
+  const score = new Array(n).fill(0);
+
+  const stopping = new Array(n).fill(0);
+  const noSupply = new Array(n).fill(0);
+  const testBar = new Array(n).fill(0);
+  const shakeout = new Array(n).fill(0);
+  const climactic = new Array(n).fill(0);
+  const spring = new Array(n).fill(0);
+  const demand = new Array(n).fill(0);
+  const effortResult = new Array(n).fill(0);
+
+  const volMA = sma(volume, VSA_WINDOW);
+  const volSD = std(volume, VSA_WINDOW);
+  const atrVals = atr(high, low, close, Math.max(5, Math.round(VSA_WINDOW / 2)));
+  const volumeZ = new Array(n).fill(0);
+
+  for (let i = 1; i < n; i++) {
+    const hi = high[i];
+    const lo = low[i];
+    const cl = close[i];
+    if (!Number.isFinite(hi) || !Number.isFinite(lo) || !Number.isFinite(cl)) continue;
+
+    const rng = hi - lo;
+    if (!Number.isFinite(rng) || rng <= 0) continue;
+
+    const refOpen = Number.isFinite(open[i]) ? open[i] : close[i - 1];
+    if (!Number.isFinite(refOpen)) continue;
+
+    const body = Math.abs(cl - refOpen);
+    const mid = lo + rng / 2;
+
+    const prevClose = Number.isFinite(close[i - 1]) ? close[i - 1] : NaN;
+    const prevOpen = Number.isFinite(open[i - 1]) ? open[i - 1] : prevClose;
+    const prevHigh = Number.isFinite(high[i - 1]) ? high[i - 1] : NaN;
+    const prevLow = Number.isFinite(low[i - 1]) ? low[i - 1] : NaN;
+    const prevRange = Number.isFinite(prevHigh) && Number.isFinite(prevLow) ? prevHigh - prevLow : NaN;
+
+    const isDown = cl < refOpen;
+    const isUp = cl > refOpen;
+
+    const longLower = (cl - lo) > 0.55 * rng;
+    const narrow = rng > 0 ? (body / rng) < 0.35 : false;
+    const ultraNarrow = rng > 0 ? (body / rng) < 0.2 : false;
+
+    const ma = volMA[i];
+    const sd = volSD[i];
+    const atrVal = atrVals[i];
+
+    const hv = Number.isFinite(ma) ? volume[i] >= (ma + (sd || 0) * 0.5) : false;
+    const ultraHv = Number.isFinite(ma) ? volume[i] >= (ma + (sd || 0) * 1.5) : false;
+    const lv = Number.isFinite(ma) ? volume[i] <= ma * 0.75 : false;
+    const ultraLv = Number.isFinite(ma) ? volume[i] <= ma * 0.55 : false;
+
+    const z = Number.isFinite(ma) && Number.isFinite(sd) && sd > 0
+      ? (volume[i] - ma) / sd
+      : (Number.isFinite(ma) && ma !== 0 ? (volume[i] / ma) - 1 : 0);
+    volumeZ[i] = Number.isFinite(z) ? z : 0;
+
+    const veryWide = Number.isFinite(atrVal) ? rng >= atrVal * 1.4 : rng > 0;
+    const closingStrong = cl >= lo + 0.65 * rng;
+    const smallResult = Number.isFinite(prevClose)
+      ? Math.abs(cl - prevClose) <= (Number.isFinite(atrVal) ? atrVal * 0.3 : rng * 0.3)
+      : false;
+
+    const downTrend = i >= 3
+      && Number.isFinite(close[i - 1])
+      && Number.isFinite(close[i - 2])
+      && Number.isFinite(close[i - 3])
+      && close[i - 1] <= close[i - 2]
+      && close[i - 2] <= close[i - 3];
+
+    const prevLows: number[] = [];
+    if (Number.isFinite(prevLow)) prevLows.push(prevLow);
+    if (i >= 2 && Number.isFinite(low[i - 2])) prevLows.push(low[i - 2]);
+    const minPrevLow = prevLows.length ? Math.min(...prevLows) : Infinity;
+    const madeLowerLow = lo < minPrevLow;
+
+    const sv = isDown && hv && cl >= mid;
+    const ns = (isDown || cl <= prevClose) && (lv || ultraLv) && (narrow || ultraNarrow) && cl <= lo + 0.25 * rng;
+    const tst = (narrow || ultraNarrow) && (lv || ultraLv) && closingStrong && Number.isFinite(prevOpen) && Number.isFinite(prevClose)
+      && prevClose < prevOpen;
+    const sho = (hv || ultraHv) && longLower && isUp && Number.isFinite(prevClose) && cl > prevClose;
+    const clim = ultraHv && isDown && closingStrong && veryWide;
+    const spr = (hv || ultraHv) && madeLowerLow && closingStrong && Number.isFinite(prevClose) && cl > prevClose;
+    const dem = (hv || ultraHv) && isUp && closingStrong && downTrend
+      && Number.isFinite(prevClose) && cl > prevClose
+      && (Number.isFinite(prevRange) ? rng >= prevRange * 0.9 : true);
+    const eff = (hv || ultraHv) && isDown && closingStrong && smallResult;
+
+    let sc = 0;
+    if (sv) { stopping[i] = 1; sc += VSA_WEIGHTS.stopping; }
+    if (ns) { noSupply[i] = 1; sc += VSA_WEIGHTS.noSupply; }
+    if (tst) { testBar[i] = 1; sc += VSA_WEIGHTS.testBar; }
+    if (sho) { shakeout[i] = 1; sc += VSA_WEIGHTS.shakeout; }
+    if (clim) { climactic[i] = 1; sc += VSA_WEIGHTS.climactic; }
+    if (spr) { spring[i] = 1; sc += VSA_WEIGHTS.spring; }
+    if (dem) { demand[i] = 1; sc += VSA_WEIGHTS.demand; }
+    if (eff) { effortResult[i] = 1; sc += VSA_WEIGHTS.effortResult; }
+
+    score[i] = sc;
+    combined[i] = sc >= VSA_ACTIVATION ? 1 : 0;
   }
-  return out;
+
+  return {
+    combined,
+    score,
+    components: { stopping, noSupply, testBar, shakeout, climactic, spring, demand, effortResult },
+    context: { volumeMA: volMA, volumeSD: volSD, volumeZ, atr: atrVals },
+    meta: { weights: VSA_WEIGHTS, activation: VSA_ACTIVATION },
+  };
 }
 
 // ---------------- Scoring (independent sliders) ----------------
@@ -187,7 +351,10 @@ function scoreBar(i: number, ctx: any){
     else if (r<=30) add("rsi", true, ctx.weights.rsi30); else parts["rsi"]=0;
   } else parts["rsi"]=0;
 
-  add("vsa", ctx.vsa[i]===1, ctx.weights.vsa);
+  const vsaStrength = ctx.vsaScore ? ctx.vsaScore[i] : undefined;
+  const hasStrength = typeof vsaStrength === "number" && Number.isFinite(vsaStrength);
+  const vsaActive = hasStrength ? vsaStrength >= VSA_ACTIVATION : ctx.vsa[i] === 1;
+  add("vsa", vsaActive, ctx.weights.vsa);
   add("smaStack", ctx.smaStack[i], ctx.weights.smaStack);
   add("prevLowUp", ctx.prevLowUp[i], ctx.weights.prevLowUp);
 
@@ -402,7 +569,7 @@ export default function App(){
 
     // VSA on raw 1h bars
     const open = rows.map(r=>r.open), high=rows.map(r=>r.high), low=rows.map(r=>r.low), vol=rows.map(r=>r.volume);
-    const vsaC = vsaSignals(open,high,low,rows.map(r=>r.close),vol).combined;
+    const { combined: vsaCombined, score: vsaScoreFull } = vsaSignals(open,high,low,rows.map(r=>r.close),vol);
 
     // --- Windowing (pan + zoom) ---
     const firstTs = rows[0].ts; const lastTs = rows[rows.length-1].ts;
@@ -421,7 +588,8 @@ export default function App(){
     const n = visRows.length;
     const ctx = {
       piBuy: piBuy.slice(s,e), mvrvzBuy: mvrvzBuy.slice(s,e), touchLower: touchLower.slice(s,e),
-      macdCross: macdCross.slice(s,e), rsi: rsiRow.slice(s,e), vsa: vsaC.slice(s,e),
+      macdCross: macdCross.slice(s,e), rsi: rsiRow.slice(s,e), vsa: vsaCombined.slice(s,e),
+      vsaScore: vsaScoreFull.slice(s,e),
       smaStack: smaStack.slice(s,e), prevLowUp: prev30LowUp.slice(s,e),
       piDeep: piRatioRow.slice(s,e).map(v=> Number.isFinite(v) && v < 0.125),
       weights

@@ -52,6 +52,50 @@ export const std = (arr, period) => {
   return out;
 };
 
+export const atr = (high, low, close, period = 14) => {
+  const n = Array.isArray(close) ? close.length : 0;
+  const out = new Array(n).fill(NaN);
+  if (!n || period <= 0) return out;
+
+  let prevClose = Number.isFinite(close[0]) ? close[0] : NaN;
+  let running = 0;
+  let seeded = false;
+  let prevAtr = NaN;
+
+  for (let i = 0; i < n; i++) {
+    const hi = Number.isFinite(high?.[i]) ? high[i] : NaN;
+    const lo = Number.isFinite(low?.[i]) ? low[i] : NaN;
+    const cl = Number.isFinite(close?.[i]) ? close[i] : prevClose;
+
+    if (!Number.isFinite(hi) || !Number.isFinite(lo)) {
+      prevClose = Number.isFinite(cl) ? cl : prevClose;
+      continue;
+    }
+
+    const trBase = hi - lo;
+    const trHigh = Number.isFinite(prevClose) ? Math.abs(hi - prevClose) : trBase;
+    const trLow = Number.isFinite(prevClose) ? Math.abs(lo - prevClose) : trBase;
+    const tr = Math.max(trBase, trHigh, trLow);
+
+    if (!seeded) {
+      running += tr;
+      const denom = i + 1;
+      out[i] = denom > 0 ? running / denom : NaN;
+      if (i + 1 >= period) {
+        seeded = true;
+        prevAtr = out[i];
+      }
+    } else {
+      prevAtr = Number.isFinite(prevAtr) ? ((prevAtr * (period - 1)) + tr) / period : tr;
+      out[i] = prevAtr;
+    }
+
+    prevClose = cl;
+  }
+
+  return out;
+};
+
 export const rsi = (arr, period = 14) => {
   const n = Array.isArray(arr) ? arr.length : 0;
   const out = new Array(n).fill(NaN);
