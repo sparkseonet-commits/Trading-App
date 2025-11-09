@@ -93,9 +93,12 @@ export default function App(){
     const startIdx = rows.findIndex((r)=> r.ts >= startTs);
     const endIdx = rows.findIndex((r)=> r.ts > endTs);
     const s = startIdx >= 0 ? startIdx : 0;
+    const endIdx = rows.findIndex((r)=> r.ts > endTs);
     const e = endIdx === -1 ? rows.length : endIdx;
 
     const visRows = rows.slice(s, e);
+    if (!visRows.length) return null;
+
     const n = visRows.length;
 
     const ctx = {
@@ -259,6 +262,19 @@ export default function App(){
               className="w-full"
             />
           </div>
+          <div className="upload">
+            <label className="button">
+              <input
+                type="file"
+                accept=".csv,text/csv"
+                onChange={(e)=> onFile(e.target.files?.[0]) }
+                style={{ display: "none" }}
+              />
+              <span>Choose CSV</span>
+            </label>
+            {filename && <div className="filename">{filename}</div>}
+          </div>
+        </header>
 
           <div className="p-4 rounded-2xl shadow bg-white/60 border">
             <h2 className="font-semibold mb-2">Weights</h2>
@@ -342,6 +358,22 @@ export default function App(){
           </footer>
         </main>
       </div>
-    </div>
+    </ErrorBoundary>
+  );
+}
+
+function Slider({ label, value, setValue, min = 0, max = 100, step = 1 }){
+  return (
+    <label className="slider">
+      <div className="label">{label}</div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e)=> setValue(Number(e.target.value))}
+      />
+    </label>
   );
 }

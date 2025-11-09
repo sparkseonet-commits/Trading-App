@@ -37,7 +37,7 @@ export function buildSignals(rows, dailyToRow){
 
   // VSA on raw 1h bars
   const open = rows.map(r=>r.open), high = rows.map(r=>r.high), low = rows.map(r=>r.low), vol = rows.map(r=>r.volume);
-  const vsaC = vsaSignals(open, high, low, rows.map(r=>r.close), vol).combined;
+  const { combined: vsaC, score: vsaScore } = vsaSignals(open, high, low, rows.map(r=>r.close), vol);
 
   return {
     series: {
