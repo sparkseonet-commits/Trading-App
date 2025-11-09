@@ -1,633 +1,418 @@
-import React, { useMemo, useRef, useState, useEffect } from "react";
+// src/app/App.jsx
+import React, { useCallback, useMemo, useState } from "react";
 import Papa from "papaparse";
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  Tooltip,
-  CartesianGrid,
-  ResponsiveContainer,
-  ReferenceLine,
-} from "recharts";
+import "./app.css";
 
-/**
- * Crypto Confidence Backtester – robust build (full file)
- * ------------------------------------------------------
- * • Upload CSV: either (a) Binance kline CSV (12 cols, no header),
- *   or (b) headered CSV: date,open,high,low,close,volume[,mvrvz]
- * • Indicators computed on UTC-daily resample and projected to 1h display.
- * • Charts aggregated to 4h for rendering; buy logic remains 1h.
- * • Absolute signals (PI≤0.30, MVRV‑Z≤0) short-circuit to 100.
- * • Sliders are INDEPENDENT (no conservation); blended score normalises
- *   by the sum of currently selected slider weights.
- * • FIX: Avoid Papa's stream path ("readable") by parsing **strings**, not File/Blob directly.
- * • Extra guards to avoid rendering with undefined/empty datasets.
- */
+import { MS_PER_DAY, SYNC_ID, DEFAULT_WEIGHTS } from "./constants";
+import { parseHeadered, parseBinance } from "../data/parse";
+import { resampleDaily, aggregate4h } from "../data/resample";
+import { computeDailyIndicators, expandDaily } from "../indicators/daily";
+import { buildSignals } from "../engine/signals";
+import { scoreBar } from "../engine/score";
 
-// ---------------- Types ----------------
-type Row = {
-  date: string | number;
-  open: number; high: number; low: number; close: number; volume: number; mvrvz?: number;
-};
+import PriceChart from "../charts/PriceChart";
+import RsiChart from "../charts/RsiChart";
+import MacdChart from "../charts/MacdChart";
+import BuyTable from "../charts/BuyTable";
 
-type ParsedRow = Row & { ts: number; dateISO: string };
-
-type Weights = {
-  bollinger: number;
-  macd: number;
-  vsa: number;
-  smaStack: number;
-  prevLowUp: number;
-  rsi10: number; rsi20: number; rsi30: number;
-  piDeep: number; // experimental: PI < 0.125 strong buy
-};
-
-const DEFAULT_WEIGHTS: Weights = {
-  bollinger: 1.0,
-  macd: 1.0,
-  vsa: 1.0,
-  smaStack: 1.5,
-  prevLowUp: 1.0,
-  rsi10: 1.5,
-  rsi20: 1.2,
-  rsi30: 1.0,
-  piDeep: 2.0, // default mid-strong influence
-};
-
-const ABSOLUTE_CAP = 100;
-const BLENDED_CAP = 99.9;
-const BARS_PER_DAY = 24; // 1h bars (raw data)
-const MS_PER_DAY = 86400000;
-const SYNC_ID = "sync-confidence";
-
-// ---------------- Epoch normalizer (handles s/ms/µs/ns) ----------------
-function normalizeEpochToMs(x: number | null | undefined): number | null {
-  if (x === null || x === undefined) return null;
-  if (!Number.isFinite(x as number)) return null;
-  const v = Math.abs(x as number);
-  if (v >= 1e18) return Math.trunc((x as number) / 1e6);  // nanoseconds → ms
-  if (v >= 1e15) return Math.trunc((x as number) / 1e3);  // microseconds → ms
-  if (v >= 1e12) return Math.trunc(x as number);          // milliseconds
-  if (v >= 1e10) return Math.trunc((x as number) * 1000); // seconds → ms
-  return Math.trunc(x as number);
-}
-
-// ---------------- Math utils ----------------
-const sma = (arr: number[], period: number): number[] => {
-  const n = arr.length; const out = new Array(n).fill(NaN);
-  if (period <= 1) return arr.slice();
-  let acc = 0; for (let i=0;i<n;i++){ acc += arr[i]; if (i>=period) acc -= arr[i-period]; if (i>=period-1) out[i] = acc/period; }
-  return out;
-};
-
-const ema = (arr: number[], period: number): number[] => {
-  const n = arr.length; const out = new Array(n).fill(NaN);
-  if (n===0) return out; if (period<=1) return arr.slice();
-  const k = 2/(period+1);
-  let i0 = 0; while (i0<n && !Number.isFinite(arr[i0])) i0++; // seed from first finite
-  if (i0===n) return out; out[i0] = arr[i0];
-  for (let i=i0+1;i<n;i++){ const v = Number.isFinite(arr[i])?arr[i]:out[i-1]; out[i] = v*k + out[i-1]*(1-k); }
-  return out;
-};
-
-const std = (arr: number[], period: number): number[] => {
-  const n = arr.length; const out = new Array(n).fill(NaN);
-  const mean = sma(arr, period);
-  for (let i=period-1;i<n;i++){
-    let s = 0; for (let j=i-period+1;j<=i;j++){ const d = arr[j] - mean[i]; s += d*d; }
-    out[i] = Math.sqrt(s/period);
+// ---------------------------------------------------------------------------
+// Error boundary to avoid white screen on unexpected runtime errors.
+class ErrorBoundary extends React.Component {
+  constructor(props){
+    super(props);
+    this.state = { hasError: false, message: "" };
   }
-  return out;
-};
-
-// Wilder RSI (14 by default)
-const rsi = (arr: number[], period: number): number[] => {
-  const n = arr.length; const out = new Array(n).fill(NaN);
-  if (n < period + 1 || period < 2) return out;
-  const deltas = new Array(n).fill(0);
-  for (let i=1;i<n;i++) deltas[i] = arr[i] - arr[i-1];
-  let gain = 0; let loss = 0;
-  for (let i=1;i<=period;i++){
-    const d = deltas[i]; if (d >= 0) gain += d; else loss -= d;
+  static getDerivedStateFromError(error){
+    return { hasError: true, message: String(error?.message || error) };
   }
-  gain /= period; loss /= period;
-  let rs = loss === 0 ? 100 : gain / loss;
-  out[period] = 100 - 100 / (1 + rs);
-  for (let i=period+1;i<n;i++){
-    const d = deltas[i];
-    const g = d > 0 ? d : 0;
-    const l = d < 0 ? -d : 0;
-    gain = (gain * (period - 1) + g) / period;
-    loss = (loss * (period - 1) + l) / period;
-    rs = loss === 0 ? 100 : gain / loss;
-    out[i] = 100 - 100 / (1 + rs);
+  componentDidCatch(error, info){
+    // eslint-disable-next-line no-console
+    console.error("ErrorBoundary:", error, info);
   }
-  return out;
-};
-
-function macdLine(arr: number[], fast=12, slow=26, signal=9){
-  const fastE = ema(arr, fast); const slowE = ema(arr, slow);
-  const macd = fastE.map((v,i)=> v - slowE[i]);
-  const sig = ema(macd, signal);
-  return { macd, signal: sig };
-}
-
-function slope(arr: number[], window=10){
-  const n = arr.length; const out = new Array(n).fill(NaN);
-  if (window<2) return out;
-  for (let i=window-1;i<n;i++){
-    let sumx=0,sumy=0,sumxy=0,sumxx=0, ok=true;
-    for (let k=0;k<window;k++){
-      const y = arr[i-window+1+k]; if (!Number.isFinite(y)){ ok=false; break; }
-      const x = k; sumx+=x; sumy+=y; sumxy+=x*y; sumxx+=x*x;
+  render(){
+    if (this.state.hasError){
+      return (
+        <div style={{ padding: 16, color: "#991b1b", background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 12 }}>
+          <b>Something went wrong while rendering.</b>
+          <div style={{ marginTop: 6, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", whiteSpace: "pre-wrap" }}>
+            {this.state.message}
+          </div>
+        </div>
+      );
     }
-    if (!ok){ out[i]=NaN; continue; }
-    const denom = window*sumxx - sumx*sumx; out[i] = denom===0?NaN:(window*sumxy - sumx*sumy)/denom;
+    return this.props.children;
   }
-  return out;
 }
 
-// ---------------- VSA (simplified) ----------------
-function vsaSignals(open: number[], high: number[], low: number[], close: number[], volume: number[]){
-  const n = close.length; const out = { combined: new Array(n).fill(0) } as { combined: number[] };
-  const volMA = sma(volume, 24); // 24h lookback
- // 20h proxy
-  const volSD = std(volume, 24);
-  for (let i=1;i<n;i++){
-    const rng = high[i]-low[i]; if (!Number.isFinite(rng) || rng<=0) { out.combined[i]=0; continue; }
-    const body = Math.abs(close[i] - (open[i] ?? close[i-1]));
-    const mid = low[i] + rng/2; const isDown = close[i] < (open[i] ?? close[i-1]); const isUp = close[i] > (open[i] ?? close[i-1]);
-    const longLower = (close[i]-low[i]) > 0.6*rng; const narrow = body/rng < 0.35;
-    const hv = Number.isFinite(volMA[i]) ? volume[i] > (volMA[i] + (volSD[i]||0)) : false;
-    const lv = Number.isFinite(volMA[i]) ? volume[i] < (volMA[i]*0.7) : false;
-    const stopping = isDown && hv && close[i]>=mid;
-    const noSupply = isDown && lv && narrow && (close[i] <= low[i]+0.25*rng);
-    const testBar = narrow && lv && (close[i] >= low[i] + 0.75*rng) && (close[i-1] < (open[i-1] ?? close[i-2] ?? close[i-1]));
-    const shakeout = hv && longLower && isUp;
-    out.combined[i] = (stopping||noSupply||testBar||shakeout) ? 1 : 0;
-  }
-  return out;
-}
+// ---------------------------------------------------------------------------
+// CSV parsing hook (headered vs Binance array format)
+function useParsedRows(format){
+  const [rows, setRows] = useState([]);
+  const [filename, setFilename] = useState("");
+  const [lastError, setLastError] = useState(null);
 
-// ---------------- Scoring (independent sliders) ----------------
-function scoreBar(i: number, ctx: any){
-  if (ctx.piBuy[i] || ctx.mvrvzBuy[i]) return { confidence: ABSOLUTE_CAP, parts: null };
-  const parts: Record<string, number> = {};
-  let raw=0, maxRaw=0;
-  const add = (k: string, active: boolean, w: number) => { const v = active? w: 0; raw += v; maxRaw += w; parts[k]=v; };
-
-  add("bollinger", ctx.touchLower[i], ctx.weights.bollinger);
-  add("macd", ctx.macdCross[i], ctx.weights.macd);
-
-  const r = ctx.rsi[i];
-  if (Number.isFinite(r)){
-    if (r<=10) add("rsi", true, ctx.weights.rsi10);
-    else if (r<=20) add("rsi", true, ctx.weights.rsi20);
-    else if (r<=30) add("rsi", true, ctx.weights.rsi30); else parts["rsi"]=0;
-  } else parts["rsi"]=0;
-
-  add("vsa", ctx.vsa[i]===1, ctx.weights.vsa);
-  add("smaStack", ctx.smaStack[i], ctx.weights.smaStack);
-  add("prevLowUp", ctx.prevLowUp[i], ctx.weights.prevLowUp);
-
-  // Experimental PI deep-buy: PI < 0.125
-  add("piDeep", ctx.piDeep[i], ctx.weights.piDeep);
-
-  const confidence = maxRaw===0 ? 0 : Math.min(BLENDED_CAP, (raw/maxRaw)*BLENDED_CAP);
-  return { confidence, parts };
-}
-
-// ---------------- 4h aggregation (OHLCV + last-known indicators) ----------------
-function aggregate4h(rows: ParsedRow[], extras: Record<string, number[]>)
-{
-  if (!rows.length) return [] as any[];
-  const FOUR_H = 4*60*60*1000; const out: any[]=[];
-  let bucket = Math.floor(rows[0].ts/FOUR_H)*FOUR_H; let cur: any | null = null;
-  const push = ()=>{ if (cur) out.push(cur); };
-  for (let i=0;i<rows.length;i++){
-    const r = rows[i]; const key = Math.floor(r.ts/FOUR_H)*FOUR_H;
-    if (!cur || key!==bucket){ push(); bucket = key; cur = { ts:key, open:r.open, high:r.high, low:r.low, close:r.close, volume:r.volume };
-    } else { cur.high=Math.max(cur.high,r.high); cur.low=Math.min(cur.low,r.low); cur.close=r.close; cur.volume += r.volume; }
-    for (const k of Object.keys(extras)) if (extras[k]) (cur as any)[k] = (extras as any)[k][i];
-  }
-  push();
-  return out;
-}
-
-// ---------------- Daily resample (UTC) ----------------
-function resampleDaily(rows: ParsedRow[]){
-  if (!rows.length) return { daily: [] as any[], rowToDay: [] as number[] };
-  const daily: { ts:number, open:number, high:number, low:number, close:number }[] = [];
-  const rowToDay: number[] = new Array(rows.length).fill(0);
-  let currentKey = Math.floor(rows[0].ts / MS_PER_DAY) * MS_PER_DAY;
-  let cur = { ts: currentKey, open: rows[0].open, high: rows[0].high, low: rows[0].low, close: rows[0].close };
-  let dayIndex = 0;
-  for (let i=0;i<rows.length;i++){
-    const dkey = Math.floor(rows[i].ts / MS_PER_DAY) * MS_PER_DAY;
-    if (dkey !== currentKey){
-      daily.push(cur); dayIndex++; currentKey = dkey; cur = { ts: dkey, open: rows[i].open, high: rows[i].high, low: rows[i].low, close: rows[i].close };
-    } else {
-      cur.high = Math.max(cur.high, rows[i].high);
-      cur.low = Math.min(cur.low, rows[i].low);
-      cur.close = rows[i].close;
-    }
-    rowToDay[i] = dayIndex;
-  }
-  daily.push(cur);
-  return { daily, rowToDay };
-}
-
-// ---------------- CSV Parsing (strict + normalized) ----------------
-function parseHeadered(data: any[]): ParsedRow[]{
-  const out: ParsedRow[]=[]; const MS_PER_DAY_LOCAL = 86400000; const excelToMs = (d:number)=> (d-25569)*MS_PER_DAY_LOCAL;
-
-  const isISOish = (s: string) =>
-    /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z)?)?$/i.test(s);
-  const isPureUnix = (s: string) =>
-    /^\d{10}$/.test(s) || /^\d{13}$/.test(s) || /^\d{16,17}$/.test(s);
-  const isExcelSerial = (s: string) =>
-    /^\d{5,}(?:\.\d+)?(?:\s+\d{1,2}:\d{2}:\d{2})?$/.test(s);
-
-  for (const d of data){
-    if (!d || d.date===undefined || d.date===null || d.date==="") continue;
-    let ts: number | null = null;
-
-    if (typeof d.date === "number"){
-      ts = normalizeEpochToMs(d.date);
-      if (ts && (d.date as number)>20000 && (d.date as number)<90000) ts = excelToMs(d.date as number);
-    } else if (typeof d.date === "string"){
-      const s = d.date.trim();
-      if (isISOish(s)){
-        const t = new Date(s).getTime(); if (Number.isFinite(t)) ts=t;
-      } else if (isPureUnix(s)){
-        ts = normalizeEpochToMs(Number(s));
-      } else if (isExcelSerial(s)){
-        const [serStr, timeStr] = s.split(/\s+/, 2);
-        const serial = Number(serStr);
-        if (Number.isFinite(serial)) {
-          ts = excelToMs(serial);
-          if (timeStr){
-            const [hh,mm,ss] = timeStr.split(":").map(v=>parseInt(v||"0",10));
-            ts += (((hh*60+mm)*60+ss)*1000);
-          }
-        }
-      } else {
-        const t = new Date(s).getTime(); if (Number.isFinite(t)) ts=t;
-      }
-    }
-
-    if (ts===null || !Number.isFinite(ts)) continue;
-    out.push({ ts, dateISO: new Date(ts).toISOString(), open:+d.open, high:+d.high, low:+d.low, close:+d.close, volume:+d.volume, mvrvz:(d.mvrvz!==undefined && d.mvrvz!=="" ? +d.mvrvz : undefined), date: d.date });
-  }
-  out.sort((a,b)=>a.ts-b.ts); return out;
-}
-
-function parseBinance(data: any[][]): ParsedRow[]{
-  const out: ParsedRow[]=[];
-  for (const row of data){
-    if (!row || row.length<6) continue;
-    const raw = Number(row[0]);
-    const ms = normalizeEpochToMs(raw);
-    if (!Number.isFinite(ms as number)) continue;
-    out.push({
-      ts: ms as number,
-      dateISO: new Date(ms as number).toISOString(),
-      open:+row[1], high:+row[2], low:+row[3], close:+row[4], volume:+row[5],
-      date: raw
-    });
-  }
-  out.sort((a,b)=>a.ts-b.ts); return out;
-}
-
-// ---------------- Component ----------------
-export default function App(){
-  const [rows,setRows] = useState<ParsedRow[]|null>(null);
-  const [threshold,setThreshold] = useState(80);
-  const [buyWindowHours,setBuyWindowHours] = useState(30*24);
-  const [windowDays,setWindowDays] = useState(365); // default 12 months
-  const [windowOffsetDays,setWindowOffsetDays] = useState(0); // 0 = end of series
-  const [weights,setWeights] = useState<Weights>({...DEFAULT_WEIGHTS});
-  const fileRef = useRef<HTMLInputElement>(null); const [fileName,setFileName] = useState("");
-
-  // Independent sliders (no conservation)
-  const setWeight = (key: keyof Weights, value: number)=>{
-    const clamp = (x:number)=> Math.max(0, Math.min(5, x));
-    setWeights(w => ({...w, [key]: clamp(value)}));
-  };
-
-  async function parseCSV(file: File){
+  const onFile = useCallback(async (file)=>{
     if (!file) return;
-    setFileName(file.name);
-    const text = await file.text(); // Avoid Papa stream path (no File/Blob input)
-    // First, parse as arrays (no header) to sniff Binance format
-    const sniff = Papa.parse(text, { header:false, dynamicTyping:true, skipEmptyLines:true });
-    const first = (sniff.data as any[])[0];
-    if (Array.isArray(first) && first.length>=6 && Number.isFinite(Number(first[0]))){
-      // Treat as Binance CSV (array rows)
-      const asArrays = sniff.data as any[][];
-      setRows(parseBinance(asArrays));
-      return;
+    setFilename(file.name);
+    try {
+      const text = await file.text();
+      const baseConfig = { dynamicTyping: true, skipEmptyLines: true };
+      if (format === "headered"){
+        const parsed = Papa.parse(text, { ...baseConfig, header: true });
+        setRows(parseHeadered(parsed.data));
+      } else {
+        const parsed = Papa.parse(text, { ...baseConfig, header: false });
+        setRows(parseBinance(parsed.data));
+      }
+      setLastError(null);
+    } catch (err){
+      // eslint-disable-next-line no-console
+      console.error("CSV parse error", err);
+      setRows([]);
+      setLastError(String(err?.message || err));
     }
-    // Else, parse as headered objects
-    const parsed = Papa.parse(text, { header:true, dynamicTyping:true, skipEmptyLines:true });
-    setRows(parseHeadered(parsed.data as any[]));
+  }, [format]);
+
+  return { rows, onFile, filename, lastError };
+}
+
+// ---------------------------------------------------------------------------
+// Utility: sample arbitrary series to 4h buckets (using last value in bucket)
+function sampleTo4h(tsSeries, valSeries){
+  const FOUR_H = 4 * 60 * 60 * 1000;
+  const out = [];
+  if (!Array.isArray(tsSeries) || !Array.isArray(valSeries) || !tsSeries.length) return out;
+  let bucket = Math.floor(tsSeries[0] / FOUR_H) * FOUR_H;
+  let last = valSeries[0];
+  for (let i = 0; i < tsSeries.length; i++){
+    const t = tsSeries[i];
+    const k = Math.floor(t / FOUR_H) * FOUR_H;
+    if (k !== bucket){
+      out.push({ ts4h: bucket, value: last });
+      bucket = k;
+    }
+    last = valSeries[i];
   }
+  out.push({ ts4h: bucket, value: last });
+  return out;
+}
 
-  // ---------------- Compute (full history first, then slice) ----------------
-  const computed = useMemo(()=>{
-    if (!rows || rows.length===0) return null;
+function mergeSeries(base, overlay, combiner){
+  if (!Array.isArray(base) || !base.length) return overlay && overlay.length ? overlay.map((o)=> combiner({}, o)) : [];
+  if (!Array.isArray(overlay) || !overlay.length) return base.slice();
+  const map = new Map(overlay.map((o)=> [o.ts4h, o]));
+  return base.map((b)=> {
+    const match = map.get(b.ts4h);
+    return match ? combiner(b, match) : { ...b };
+  });
+}
 
-    // Daily resample once
+const toOverlay = (series, key) =>
+  Array.isArray(series)
+    ? series.map((item)=> ({ ts4h: item.ts4h, [key]: item.value ?? item[key] ?? item }))
+    : [];
+
+// ---------------------------------------------------------------------------
+export default function App(){
+  const [format, setFormat] = useState("binance");
+  const { rows, onFile, filename, lastError } = useParsedRows(format);
+
+  const [threshold, setThreshold] = useState(80);
+  const [maxBuyWindowH, setMaxBuyWindowH] = useState(720);
+  const [cooldownH, setCooldownH] = useState(720);
+  const [visibleDays, setVisibleDays] = useState(365);
+  const [offsetDays, setOffsetDays] = useState(0);
+  const [weights, setWeights] = useState(() => ({ ...DEFAULT_WEIGHTS }));
+  const setWeightValue = useCallback((key, value)=>{
+    const clamped = Math.max(0, Math.min(5, value));
+    setWeights((w)=> ({ ...w, [key]: clamped }));
+  }, []);
+  const setWeight = useCallback((key)=> (value)=> setWeightValue(key, value), [setWeightValue]);
+
+  // Daily bundle (resample once, compute indicators once)
+  const dailyBundle = useMemo(()=>{
+    if (!rows.length) return null;
     const { daily, rowToDay } = resampleDaily(rows);
     if (!daily.length) return null;
+    const d = computeDailyIndicators(daily, rows);
+    const expand = (arr) => expandDaily(arr, rowToDay);
+    return {
+      daily,
+      rowToDay,
+      dBBlowerRow:   expand(d.dBBlower),
+      dRSIRow:       expand(d.dRSI),
+      dMACDRow:      expand(d.dMACD),
+      dMACDSigRow:   expand(d.dMACDsig),
+      dMACDCrossRow: expand(d.dMACDCross).map(Boolean),
+      dSMA7Row:      expand(d.dSMA7),
+      dSMA30Row:     expand(d.dSMA30),
+      dSMA90Row:     expand(d.dSMA90),
+      dSmaStackRow:  expand(d.dSmaStack).map(Boolean),
+      dPrev30LowUpRow: expand(d.dPrev30LowUp).map(Boolean),
+      dPiBuyRow:     expand(d.dPiBuy),
+      dPiRatioRow:   expand(d.dPiRatio),
+      rMvrvBuyRow:   d.rMvrvBuy,
+    };
+  }, [rows]);
 
-    const dClose = daily.map(d=>d.close);
-    const dLow   = daily.map(d=>d.low);
+  // Row-level signals (VSA + expanded daily context)
+  const sig = useMemo(()=>{
+    if (!rows.length || !dailyBundle) return null;
+    return buildSignals(rows, {
+      dBBlowerRow: dailyBundle.dBBlowerRow,
+      dRSIRow: dailyBundle.dRSIRow,
+      dMACDRow: dailyBundle.dMACDRow,
+      dMACDSigRow: dailyBundle.dMACDSigRow,
+      dMACDCrossRow: dailyBundle.dMACDCrossRow,
+      dSMA7Row: dailyBundle.dSMA7Row,
+      dSMA30Row: dailyBundle.dSMA30Row,
+      dSMA90Row: dailyBundle.dSMA90Row,
+      dSmaStackRow: dailyBundle.dSmaStackRow,
+      dPrev30LowUpRow: dailyBundle.dPrev30LowUpRow,
+      dPiBuyRow: dailyBundle.dPiBuyRow,
+      dPiRatioRow: dailyBundle.dPiRatioRow,
+      rMvrvBuyRow: dailyBundle.rMvrvBuyRow,
+    });
+  }, [rows, dailyBundle]);
 
-    // --- Daily indicators ---
-    const dSMA7   = sma(dClose, 7);
-    const dSMA30  = sma(dClose, 30);
-    const dSMA90  = sma(dClose, 90);
-    const dSMA111 = sma(dClose,111);
-    const dSMA350 = sma(dClose,350);
+  // Windowing + scoring + aggregation for charts
+  const view = useMemo(()=>{
+    if (!rows.length || !sig) return null;
 
-    // PI & MVRV (absolute)
-    const dPiRatio = dSMA111.map((v,i)=> Number.isFinite(v) && Number.isFinite(dSMA350[i]) && dSMA350[i]!==0 ? v/(2*dSMA350[i]) : NaN);
-    const dPiBuy   = dPiRatio.map(v=> Number.isFinite(v) && v<=0.30);
-    const rMvrvBuy= rows.map(r=> r.mvrvz!==undefined && r.mvrvz<=0); // already row-level
+    const firstTs = rows[0].ts;
+    const lastTs = rows[rows.length - 1].ts;
+    const maxSpanDays = Math.max(1, Math.floor((lastTs - firstTs) / MS_PER_DAY));
+    const wndDays = Math.min(visibleDays, maxSpanDays);
+    const offsetClamped = Math.min(Math.max(0, offsetDays), Math.max(0, maxSpanDays - wndDays));
 
-    // Bollinger 20d
-    const dBBma = sma(dClose, 20); const dBBsd = std(dClose, 20);
-    const dBBlower = dBBma.map((m,i)=> Number.isFinite(m)&&Number.isFinite(dBBsd[i]) ? m - 2*dBBsd[i] : NaN);
+    const startTs = Math.max(firstTs, lastTs - (offsetClamped + wndDays) * MS_PER_DAY);
+    const endTs = Math.min(lastTs, startTs + wndDays * MS_PER_DAY);
 
-    // MACD daily 12/26/9
-    const { macd: dMACD, signal: dMACDsig } = macdLine(dClose, 12, 26, 9);
-    const dMACDcross = dMACD.map((m,i)=> i>0 && Number.isFinite(m)&&Number.isFinite(dMACDsig[i]) && Number.isFinite(dMACD[i-1])&&Number.isFinite(dMACDsig[i-1]) && m> dMACDsig[i] && dMACD[i-1] <= dMACDsig[i-1]);
-
-    // RSI daily 14
-    const dRSI = rsi(dClose, 14);
-
-    // SMA stack persistence: 5 consecutive days
-    const condToday = dSMA30.map((v,i)=> Number.isFinite(v)&&Number.isFinite(dSMA90[i])&&Number.isFinite(dSMA7[i]) && v> dSMA90[i] && dSMA7[i] > v);
-    const dSmaStack = new Array(daily.length).fill(false); let run=0; const persist=5; for (let i=0;i<daily.length;i++){ run = condToday[i]? run+1:0; if (run>=persist) dSmaStack[i]=true; }
-
-    // Previous 30d low + uptrend (90d SMA slope > 0 on daily)
-    const roll=30; const dRollLow = new Array(daily.length).fill(NaN);
-    for (let i=roll-1;i<daily.length;i++){ let m=Infinity; for (let j=i-roll+1;j<=i;j++) m=Math.min(m,dLow[j]); dRollLow[i]=m; }
-    const slope90 = slope(dSMA90.map(v=> Number.isFinite(v)?v:NaN), 10);
-    const up90 = slope90.map(v=> Number.isFinite(v)&&v>0);
-    const dTouchPrev30 = dLow.map((v,i)=> i>0 && Number.isFinite(dRollLow[i-1]) && v<=dRollLow[i-1]);
-    const dPrev30LowUp = dTouchPrev30.map((t,i)=> t && up90[i]);
-
-    // --- Expand daily arrays to row resolution ---
-    const expand = (arr:number[]) => rows.map((_,i)=> arr[rowToDay[i]]);
-
-    const piBuy      = expand(dPiBuy);
-    const piRatioRow = expand(dPiRatio);
-    const mvrvzBuy   = rMvrvBuy; // already row-aligned
-    const bbLowerRow = expand(dBBlower);
-    const rsiRow     = expand(dRSI);
-    const macdRow    = expand(dMACD);
-    const macdSigRow = expand(dMACDsig);
-    const macdCross  = expand(dMACDcross).map(Boolean);
-    const sma7Row    = expand(dSMA7);
-    const sma30Row   = expand(dSMA30);
-    const sma90Row   = expand(dSMA90);
-    const smaStack   = expand(dSmaStack).map(Boolean);
-    const prev30LowUp= expand(dPrev30LowUp).map(Boolean);
-
-    // Bollinger touch (row-level close vs daily lower band)
-    const touchLower = rows.map((r,i)=> Number.isFinite(bbLowerRow[i]) && r.close <= bbLowerRow[i]);
-
-    // VSA on raw 1h bars
-    const open = rows.map(r=>r.open), high=rows.map(r=>r.high), low=rows.map(r=>r.low), vol=rows.map(r=>r.volume);
-    const vsaC = vsaSignals(open,high,low,rows.map(r=>r.close),vol).combined;
-
-    // --- Windowing (pan + zoom) ---
-    const firstTs = rows[0].ts; const lastTs = rows[rows.length-1].ts;
-    const maxSpanDays = Math.max(1, Math.floor((lastTs-firstTs)/MS_PER_DAY));
-    const wndDays = Math.min(windowDays, maxSpanDays);
-    const offsetClamped = Math.min(Math.max(0, windowOffsetDays), Math.max(0, maxSpanDays - wndDays));
-
-    const startTs = Math.max(firstTs, lastTs - (offsetClamped + wndDays)*MS_PER_DAY);
-    const endTs   = Math.min(lastTs,  startTs + wndDays*MS_PER_DAY);
-    const startIdx = rows.findIndex(r=> r.ts >= startTs);
-    const endIdx   = rows.findIndex(r=> r.ts > endTs);
+    const startIdx = rows.findIndex((r)=> r.ts >= startTs);
     const s = startIdx >= 0 ? startIdx : 0;
+    const endIdx = rows.findIndex((r)=> r.ts > endTs);
     const e = endIdx === -1 ? rows.length : endIdx;
 
     const visRows = rows.slice(s, e);
+    if (!visRows.length) return null;
+
     const n = visRows.length;
+    const piRatioSlice = sig.features.piRatioRow.slice(s, e);
     const ctx = {
-      piBuy: piBuy.slice(s,e), mvrvzBuy: mvrvzBuy.slice(s,e), touchLower: touchLower.slice(s,e),
-      macdCross: macdCross.slice(s,e), rsi: rsiRow.slice(s,e), vsa: vsaC.slice(s,e),
-      smaStack: smaStack.slice(s,e), prevLowUp: prev30LowUp.slice(s,e),
-      piDeep: piRatioRow.slice(s,e).map(v=> Number.isFinite(v) && v < 0.125),
-      weights
+      piBuy: sig.absolutes.piBuy.slice(s, e),
+      mvrvzBuy: sig.absolutes.mvrvzBuy.slice(s, e),
+      touchLower: sig.features.touchLower.slice(s, e),
+      macdCross: sig.series.macdCross.slice(s, e),
+      rsi: sig.series.rsiRow.slice(s, e),
+      vsa: sig.features.vsaC.slice(s, e),
+      smaStack: sig.series.smaStack.slice(s, e),
+      prevLowUp: sig.series.prev30LowUp.slice(s, e),
+      piDeep: piRatioSlice.map((v)=> Number.isFinite(v) && v < 0.125),
+      weights,
     };
 
-    // Confidence & parts
-    const confidence = new Array(n).fill(0) as number[]; const partsArr = new Array(n).fill(null) as any[];
-    for (let i=0;i<n;i++){ const { confidence:c, parts } = scoreBar(i, ctx); confidence[i]=c; partsArr[i]=parts; }
-
-    // Buys with cooldown (first cross-up) (should not shift domain)
-    const cooldownMs = buyWindowHours*60*60*1000; const buys: any[]=[]; let lastBuyTs = -Infinity;
-    for (let i=1;i<n;i++){
-      const ts = visRows[i].ts; const cross = confidence[i]>=threshold && confidence[i-1]<threshold; if (cross && ts-lastBuyTs>=cooldownMs){ buys.push({ index:i, ts, conf: confidence[i], parts: partsArr[i] }); lastBuyTs = ts; }
+    const conf = new Array(n).fill(0);
+    const partsArr = new Array(n).fill(null);
+    for (let i = 0; i < n; i++){
+      const { confidence, parts } = scoreBar(i, ctx);
+      conf[i] = confidence;
+      partsArr[i] = parts || undefined;
     }
 
-    // Build 4h display aligned with slice using expanded indicators
-    const extras = { rsi: rsiRow.slice(s,e), macd: macdRow.slice(s,e), macdSig: macdSigRow.slice(s,e), sma7: sma7Row.slice(s,e), sma30: sma30Row.slice(s,e), sma90: sma90Row.slice(s,e), pi: piRatioRow.slice(s,e) };
-    const display4h = aggregate4h(visRows, extras);
+    const windowMs = maxBuyWindowH * 60 * 60 * 1000;
+    const cooldownMs = cooldownH * 60 * 60 * 1000;
+    const buys = [];
+    let lastBuyTs = -Infinity;
+    for (let i = 1; i < n; i++){
+      const ts = visRows[i].ts;
+      const crossedUp = conf[i] >= threshold && conf[i - 1] < threshold;
+      if (!crossedUp) continue;
+      const cutoff = ts + windowMs;
+      let isPeak = true;
+      for (let j = i + 1; j < n && visRows[j].ts <= cutoff; j++){
+        if (conf[j] > conf[i]) { isPeak = false; break; }
+      }
+      if (isPeak && ts - lastBuyTs >= cooldownMs){
+        buys.push({ ts, confidence: conf[i], parts: partsArr[i] });
+        lastBuyTs = ts;
+      }
+    }
 
-    return { visRows, display4h, buys, confidence, firstTs, lastTs, wndDays, offsetClamped };
-  }, [rows, windowDays, windowOffsetDays, threshold, buyWindowHours, weights]);
+    const { data: base4h } = aggregate4h(visRows);
+    const tsSlice = visRows.map((r)=> r.ts);
 
-  const buyLines4h = useMemo(()=>{
-    if (!computed) return [] as number[]; const FOUR_H = 4*60*60*1000; return computed.buys.map(b=> Math.floor(b.ts/FOUR_H)*FOUR_H);
-  }, [computed]);
+    const sample = (vals) => sampleTo4h(tsSlice, vals).map((p)=> ({ ts4h: p.ts4h, value: p.value }));
 
-  // ---------------- UI helpers ----------------
-  const formatDateShort = (ts:number)=>{ const d = new Date(ts); const y=d.getUTCFullYear(); const m=String(d.getUTCMonth()+1).padStart(2,'0'); const day=String(d.getUTCDate()).padStart(2,'0'); return `${y}-${m}-${day}`; };
-  const formatDate = (ts:number)=> new Date(ts).toISOString().slice(0,16).replace("T"," ");
+    const sma7 = sample(sig.series.sma7Row.slice(s, e));
+    const sma30 = sample(sig.series.sma30Row.slice(s, e));
+    const sma90 = sample(sig.series.sma90Row.slice(s, e));
+    const pi4h = sample(piRatioSlice);
 
-  // Self-tests to catch regressions (acts as simple test cases)
-  useEffect(()=>{
-    try {
-      // Indicator sanity on simple deterministic series
-      const t = Array.from({length:200},(_,i)=> 100+Math.sin(i/7)*2 + (i/500));
-      const _r = rsi(t,14); const _m = macdLine(t,12,26,9); if (!_r || !_m.macd || !_m.signal) throw new Error("Indicators failed");
-      // Daily resample ordering
-      const base = 1700000000000; // fixed epoch
-      const demo: ParsedRow[] = [0,1,2,3,4,5].map(h=> ({ ts: base + h*3600000, dateISO: new Date(base + h*3600000).toISOString(), open:1,high:1,low:1,close:1,volume:1, date: base + h*3600000 }));
-      const rd = resampleDaily(demo); if (!rd.daily.length) throw new Error("Daily resample produced 0 length");
-      // Buy lines test: floor-to-4h aligns with domain
-      const FOUR_H = 4*60*60*1000;
-      const lines = [0,1,2,3,4,5].map(i=> Math.floor((base + i*FOUR_H)/FOUR_H)*FOUR_H);
-      if (new Set(lines).size !== lines.length) throw new Error("Buy lines dedupe failure");
-    } catch(err){ console.warn("Self-test failed", err); }
-  },[]);
+    let display4h = base4h.slice();
+    display4h = mergeSeries(display4h, toOverlay(sma7, "sma7"), (a,b)=> ({ ...a, ...b }));
+    display4h = mergeSeries(display4h, toOverlay(sma30, "sma30"), (a,b)=> ({ ...a, ...b }));
+    display4h = mergeSeries(display4h, toOverlay(sma90, "sma90"), (a,b)=> ({ ...a, ...b }));
+    display4h = mergeSeries(display4h, toOverlay(pi4h, "pi"), (a,b)=> ({ ...a, ...b }));
 
-  const hasData = !!computed && Array.isArray(computed.display4h) && computed.display4h.length>0;
+    const rsi4h = sample(sig.series.rsiRow.slice(s, e)).map((p)=> ({ ts4h: p.ts4h, rsi: p.value }));
+    const macdBase = sample(sig.series.macdRow.slice(s, e)).map((p)=> ({ ts4h: p.ts4h, macd: p.value }));
+    const macdSig = sample(sig.series.macdSigRow.slice(s, e)).map((p)=> ({ ts4h: p.ts4h, signal: p.value }));
+    let macd4h = mergeSeries(macdBase, macdSig, (a,b)=> ({ ...a, signal: b.signal }));
+    macd4h = macd4h.map((item)=> ({
+      ...item,
+      hist: Number.isFinite(item.macd) && Number.isFinite(item.signal)
+        ? item.macd - item.signal
+        : undefined,
+    }));
+
+    const FOUR_H = 4 * 60 * 60 * 1000;
+    const buyLines4h = Array.from(new Set(buys.map((b)=> Math.floor(b.ts / FOUR_H) * FOUR_H))).sort((a,b)=> a - b);
+
+    return {
+      firstTs,
+      lastTs,
+      visRows,
+      conf,
+      buys,
+      display4h,
+      buyLines4h,
+      rsi4h,
+      macd4h,
+      pi4h,
+    };
+  }, [rows, sig, visibleDays, offsetDays, threshold, maxBuyWindowH, cooldownH, weights]);
 
   return (
-    <div className="p-6 space-y-6 max-w-7xl mx-auto">
-      <header className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Crypto Confidence Backtester</h1>
-        <div className="flex gap-2 items-center">
-          <input id="file" ref={fileRef} type="file" accept=".csv" className="hidden" onChange={async (e)=>{ if (!e.target.files || e.target.files.length===0) return; const f=e.target.files[0]; await parseCSV(f); }}/>
-          <button className="px-4 py-2 rounded-xl shadow bg-black text-white" onClick={()=>fileRef.current?.click()}>Choose CSV</button>
-          <input type="text" readOnly value={fileName||"No file chosen"} className="px-3 py-2 rounded-xl border bg-white/70 text-sm w-64" />
-        </div>
-      </header>
-
-      {computed && (
-        <div className="text-xs text-gray-700 bg-yellow-50 border border-yellow-200 rounded p-2">
-          First: {new Date(computed.firstTs).toISOString()} | Last: {new Date(computed.lastTs).toISOString()}
-        </div>
-      )}
-
-      <div className="grid md:grid-cols-12 gap-4">
-        {/* Sidebar ~1/3 */}
-        <aside className="md:col-span-4 space-y-4">
-          <div className="p-4 rounded-2xl shadow bg-white/60 border">
-            <h2 className="font-semibold mb-2">Scoring Controls</h2>
-            <div className="text-sm">Master threshold: <b>{threshold}</b></div>
-            <input type="range" min={0} max={100} step={0.1} value={threshold} onChange={e=>setThreshold(parseFloat(e.target.value))} className="w-full"/>
-            <div className="mt-3 text-sm">Max buy window (hours): <b>{buyWindowHours}</b></div>
-            <input type="range" min={24} max={90*24} step={24} value={buyWindowHours} onChange={e=>setBuyWindowHours(parseInt(e.target.value))} className="w-full"/>
-            <p className="text-xs text-gray-600 mt-1">Cooldown between buys (e.g. 720 ≈ 30 days).</p>
-            <div className="mt-3 text-sm">Visible window (days): <b>{windowDays}</b></div>
-            <input type="range" min={30} max={1100} step={5} value={windowDays} onChange={e=>setWindowDays(parseInt(e.target.value))} className="w-full"/>
-            <div className="mt-3 text-sm">Offset from end (days): <b>{windowOffsetDays}</b></div>
-            <input type="range" min={0} max={1100} step={5} value={windowOffsetDays} onChange={e=>setWindowOffsetDays(parseInt(e.target.value))} className="w-full"/>
-          </div>
-
-          <div className="p-4 rounded-2xl shadow bg-white/60 border">
-            <h2 className="font-semibold mb-2">Weights</h2>
-            {(["bollinger","macd","vsa","smaStack","prevLowUp"] as (keyof Weights)[]).map(k=> (
-              <div key={k} className="mb-3">
-                <div className="flex justify-between text-sm"><span>{k}</span><span>{weights[k].toFixed(2)}</span></div>
-                <input type="range" min={0} max={5} step={0.05} value={weights[k]} onChange={(e)=>setWeight(k, parseFloat(e.target.value))} className="w-full"/>
-              </div>
-            ))}
-            <div className="text-xs text-gray-600">RSI band weights</div>
-            {["rsi10","rsi20","rsi30"].map((k)=> (
-              <div key={k} className="mb-2">
-                <div className="flex justify-between text-sm"><span>{k}</span><span>{(weights as any)[k].toFixed(2)}</span></div>
-                <input type="range" min={0} max={5} step={0.05} value={(weights as any)[k]} onChange={(e)=>setWeight(k as keyof Weights, parseFloat(e.target.value))} className="w-full"/>
-              </div>
-            ))}
-            <div className="text-xs text-gray-600 mt-3">Experimental</div>
-            <div className="mb-2">
-              <div className="flex justify-between text-sm"><span>PI deep-buy (PI &lt; 0.125)</span><span>{weights.piDeep.toFixed(2)}</span></div>
-              <input type="range" min={0} max={5} step={0.05} value={weights.piDeep} onChange={(e)=>setWeight("piDeep", parseFloat(e.target.value))} className="w-full"/>
+    <ErrorBoundary>
+      <div className="page">
+        <header className="top">
+          <div>
+            <h2>Crypto Confidence Backtester</h2>
+            <div className="toggle">
+              <label>
+                <input
+                  type="radio"
+                  checked={format === "headered"}
+                  onChange={()=> setFormat("headered")}
+                />
+                <span style={{ marginLeft: 6 }}>Headered CSV</span>
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  checked={format === "binance"}
+                  onChange={()=> setFormat("binance")}
+                />
+                <span style={{ marginLeft: 6 }}>Binance Kline CSV</span>
+              </label>
             </div>
-            <p className="text-xs text-gray-600 mt-1">Absolute: PI≤0.30, MVRV‑Z≤0 → confidence 100.</p>
           </div>
-        </aside>
+          <div className="upload">
+            <label className="button">
+              <input
+                type="file"
+                accept=".csv,text/csv"
+                onChange={(e)=> onFile(e.target.files?.[0]) }
+                style={{ display: "none" }}
+              />
+              <span>Choose CSV</span>
+            </label>
+            {filename && <div className="filename">{filename}</div>}
+          </div>
+        </header>
 
-        {/* Main area ~2/3 */}
-        <main className="md:col-span-8 space-y-4">
-          <section className="p-4 rounded-2xl shadow bg-white/60 border">
-            <h2 className="font-semibold mb-3">Price</h2>
-            {!hasData ? <div className="text-gray-500 text-sm">Upload data to see charts.</div> : (
-              <div className="h-[480px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={computed!.display4h} margin={{top:10,right:20,left:10,bottom:10}} syncId={SYNC_ID}>
-                    <CartesianGrid strokeDasharray="3 3"/>
-                    <XAxis type="number" dataKey="ts" tickFormatter={(v)=>formatDateShort(v as number)} domain={["dataMin","dataMax"]} minTickGap={16}/>
-                    <YAxis yAxisId="price" domain={["auto","auto"]}/>
-                    <YAxis yAxisId="pi" orientation="right" domain={[0,1]} tickFormatter={(v)=>Number(v).toFixed(2)} allowDecimals/>
-                    <Tooltip formatter={(v:any,n:string)=>[typeof v === "number" ? Number(v).toFixed(2) : v, n]} labelFormatter={(l)=>new Date(l as number).toISOString().replace("T"," ").slice(0,16)}/>
-                    <Line yAxisId="price" type="monotone" dataKey="close" name="Close (4h)" dot={false} strokeWidth={2}/>
-                    <Line yAxisId="price" type="monotone" dataKey="sma7" name="SMA 7d" dot={false} strokeDasharray="4 2"/>
-                    <Line yAxisId="price" type="monotone" dataKey="sma30" name="SMA 30d" dot={false} strokeDasharray="3 3"/>
-                    <Line yAxisId="price" type="monotone" dataKey="sma90" name="SMA 90d" dot={false} strokeDasharray="6 2"/>
-                    <Line yAxisId="pi" type="monotone" dataKey="pi" name="PI (111/(2*350))" dot={false} strokeWidth={1.5} stroke="#ec4899"/>
-                    <ReferenceLine yAxisId="pi" y={0.3} stroke="#ec4899" strokeDasharray="4 2" ifOverflow="clip" />
-                    {(buyLines4h as number[]).filter(ts=>Number.isFinite(ts)).map((ts,i)=>(
-                      <ReferenceLine key={i} xAxisId={0} x={ts} stroke="green" strokeDasharray="6 4" label={{value:"BUY",position:"top",fill:"green"}} ifOverflow="extendDomain"/>
-                    ))}
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
+        {rows.length > 0 && (
+          <div className="meta">
+            First: {new Date(rows[0].ts).toISOString()} | Last: {new Date(rows[rows.length - 1].ts).toISOString()}
+          </div>
+        )}
+
+        <div className="grid">
+          <section className="panel">
+            <h3>Scoring Controls</h3>
+            <Slider label={`Master threshold: ${threshold}`} min={1} max={100} step={1} value={threshold} setValue={setThreshold} />
+            <Slider label={`Max buy window (hours): ${maxBuyWindowH}`} min={1} max={1440} step={1} value={maxBuyWindowH} setValue={setMaxBuyWindowH} />
+            <p className="muted">Cooldown between buys (e.g. 720 ≈ 30 days).</p>
+            <Slider label={`Cooldown between buys (hours): ${cooldownH}`} min={1} max={1440} step={1} value={cooldownH} setValue={setCooldownH} />
+            <Slider label={`Visible window (days): ${visibleDays}`} min={7} max={720} step={1} value={visibleDays} setValue={setVisibleDays} />
+            <Slider label={`Offset from end (days): ${offsetDays}`} min={0} max={365} step={1} value={offsetDays} setValue={setOffsetDays} />
+          </section>
+
+          <section className="panel">
+            <h3>Price</h3>
+            {view ? (
+              <PriceChart
+                data={mergeSeries(view.display4h, toOverlay(view.pi4h, "pi"), (a,b)=> ({ ...a, ...b }))}
+                buys={view.buyLines4h}
+                syncId={SYNC_ID}
+              />
+            ) : (
+              <div className="muted">Load a CSV to see charts.</div>
             )}
           </section>
 
-          {hasData && (
-            <section className="p-4 rounded-2xl shadow bg-white/60 border">
-              <h2 className="font-semibold mb-3">RSI (14d)</h2>
-              <div className="h-[160px] mb-3">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={computed!.display4h} margin={{top:5,right:20,left:10,bottom:5}} syncId={SYNC_ID}>
-                    <CartesianGrid strokeDasharray="3 3"/>
-                    <XAxis type="number" dataKey="ts" tickFormatter={(v)=>formatDateShort(v as number)} domain={["dataMin","dataMax"]} minTickGap={16}/>
-                    <YAxis domain={[0,100]}/>
-                    <ReferenceLine y={30} stroke="#9ca3af" strokeDasharray="3 3" ifOverflow="clip"/>
-                    <ReferenceLine y={70} stroke="#9ca3af" strokeDasharray="3 3" ifOverflow="clip"/>
-                    <Tooltip formatter={(v:any)=>[typeof v === "number" ? Number(v).toFixed(2) : v,"RSI (14d)"]} labelFormatter={(l)=>new Date(l as number).toISOString().replace("T"," ").slice(0,16)}/>
-                    <Line type="monotone" dataKey="rsi" name="RSI (14d)" dot={false} strokeWidth={1.5}/>
-                    {(buyLines4h as number[]).map((ts,i)=>(
-                      <ReferenceLine key={i} x={ts} stroke="green" strokeDasharray="6 4" ifOverflow="extendDomain"/>
-                    ))}
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
+          <section className="panel">
+            <h3>Weights</h3>
+            <Slider label={`bollinger (${weights.bollinger.toFixed(2)})`} min={0} max={5} step={0.05} value={weights.bollinger} setValue={setWeight("bollinger")} />
+            <Slider label={`macd (${weights.macd.toFixed(2)})`} min={0} max={5} step={0.05} value={weights.macd} setValue={setWeight("macd")} />
+            <Slider label={`vsa (${weights.vsa.toFixed(2)})`} min={0} max={5} step={0.05} value={weights.vsa} setValue={setWeight("vsa")} />
+            <Slider label={`smaStack (${weights.smaStack.toFixed(2)})`} min={0} max={5} step={0.05} value={weights.smaStack} setValue={setWeight("smaStack")} />
+            <Slider label={`prevLowUp (${weights.prevLowUp.toFixed(2)})`} min={0} max={5} step={0.05} value={weights.prevLowUp} setValue={setWeight("prevLowUp")} />
+            <div className="subtle">RSI band weights</div>
+            <Slider label={`rsi10 (${weights.rsi10.toFixed(2)})`} min={0} max={5} step={0.05} value={weights.rsi10} setValue={setWeight("rsi10")} />
+            <Slider label={`rsi20 (${weights.rsi20.toFixed(2)})`} min={0} max={5} step={0.05} value={weights.rsi20} setValue={setWeight("rsi20")} />
+            <Slider label={`rsi30 (${weights.rsi30.toFixed(2)})`} min={0} max={5} step={0.05} value={weights.rsi30} setValue={setWeight("rsi30")} />
+            <div className="subtle">Experimental</div>
+            <Slider label={`PI deep-buy (PI < 0.125): ${weights.piDeep.toFixed(2)}`} min={0} max={5} step={0.05} value={weights.piDeep} setValue={setWeight("piDeep")} />
+            <p className="muted">Absolute: PI ≤ 0.30, MVRV-Z ≤ 0 → confidence 100.</p>
+          </section>
 
-              <h2 className="font-semibold mb-3">MACD (12/26/9 daily)</h2>
-              <div className="h-[160px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={computed!.display4h} margin={{top:5,right:20,left:10,bottom:5}} syncId={SYNC_ID}>
-                    <CartesianGrid strokeDasharray="3 3"/>
-                    <XAxis type="number" dataKey="ts" tickFormatter={(v)=>formatDateShort(v as number)} domain={["dataMin","dataMax"]} minTickGap={16}/>
-                    <YAxis domain={["auto","auto"]}/>
-                    <Tooltip labelFormatter={(l)=>new Date(l as number).toISOString().replace("T"," ").slice(0,16)}/>
-                    <Line type="monotone" dataKey="macd" name="MACD" dot={false} strokeWidth={1.5}/>
-                    <Line type="monotone" dataKey="macdSig" name="Signal" dot={false} strokeWidth={1.2} strokeDasharray="4 2"/>
-                    {(buyLines4h as number[]).map((ts,i)=>(
-                      <ReferenceLine key={i} x={ts} stroke="green" strokeDasharray="6 4" ifOverflow="extendDomain"/>
-                    ))}
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </section>
+          <section className="panel">
+            <h3>RSI (14d)</h3>
+            {view ? (
+              <RsiChart data={view.rsi4h} buys={view.buyLines4h} syncId={SYNC_ID} />
+            ) : (
+              <div className="muted">Upload data to see RSI.</div>
+            )}
+          </section>
+
+          <section className="panel">
+            <h3>MACD</h3>
+            {view ? (
+              <MacdChart data={view.macd4h} buys={view.buyLines4h} syncId={SYNC_ID} />
+            ) : (
+              <div className="muted">Upload data to see MACD.</div>
+            )}
+          </section>
+        </div>
+
+        <section className="panel">
+          <h3>Buy Signals</h3>
+          {view ? (
+            <BuyTable buys={view.buys} />
+          ) : (
+            <div className="muted" style={{ padding: 8 }}>
+              {lastError ? `Error: ${lastError}` : "Load a CSV to see results."}
+            </div>
           )}
-
-          {hasData && (
-            <section className="p-4 rounded-2xl shadow bg-white/60 border">
-              <h2 className="font-semibold mb-3">Buy Signals</h2>
-              <div className="overflow-x-auto">
-                <table className="min-w-full text-sm">
-                  <thead>
-                    <tr className="text-left border-b"><th className="py-2 pr-4">Date (1h)</th><th className="py-2 pr-4">Confidence</th><th className="py-2 pr-4">Contributors</th></tr>
-                  </thead>
-                  <tbody>
-                    {computed!.buys.map((b: any, idx: number)=> (
-                      <tr key={idx} className="border-b hover:bg-gray-50">
-                        <td className="py-2 pr-4 whitespace-nowrap">{formatDate(b.ts)}</td>
-                        <td className="py-2 pr-4">{b.conf.toFixed(2)}</td>
-                        <td className="py-2 pr-4">{b.parts ? (
-                          <div className="flex flex-wrap gap-2">
-                            {Object.entries(b.parts).filter(([,v])=> (v as number)>0).map(([k,v])=> (
-                              <span key={k} className="px-2 py-1 rounded-full bg-green-100 text-green-700">{k}: {(v as number).toFixed(2)}</span>
-                            ))}
-                          </div>
-                        ) : (
-                          <span className="text-gray-500">Absolute</span>
-                        )}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-          )}
-
-          <footer className="text-xs text-gray-500">Hover charts to see synced cursor. Green dashed lines = BUY. Adjust threshold, weights, cooldown, window size and offset to explore entries. PI line shows the 111/(2*350) ratio on right axis; dashed 0.30 line is the absolute rule. Experimental PI deep-buy fires when PI &lt; 0.125 (weighted by its slider).</footer>
-        </main>
+        </section>
       </div>
-    </div>
+    </ErrorBoundary>
+  );
+}
+
+function Slider({ label, value, setValue, min = 0, max = 100, step = 1 }){
+  return (
+    <label className="slider">
+      <div className="label">{label}</div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e)=> setValue(Number(e.target.value))}
+      />
+    </label>
   );
 }
