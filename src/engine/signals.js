@@ -37,12 +37,12 @@ export function buildSignals(rows, dailyToRow){
 
   // VSA on raw 1h bars
   const open = rows.map(r=>r.open), high = rows.map(r=>r.high), low = rows.map(r=>r.low), vol = rows.map(r=>r.volume);
-  const vsaC = vsaSignals(open, high, low, rows.map(r=>r.close), vol).combined;
+  const { combined: vsaC, score: vsaScore } = vsaSignals(open, high, low, rows.map(r=>r.close), vol);
 
   // Expose the context needed by scoring (windowing is done in the caller)
   return {
     series: { bbLowerRow, rsiRow, macdRow, macdSigRow, macdCross, sma7Row, sma30Row, sma90Row, smaStack, prev30LowUp },
     absolutes: { piBuy, mvrvzBuy },
-    features: { touchLower, vsaC, piRatioRow }
+    features: { touchLower, vsaC, vsaScore, piRatioRow }
   };
 }
