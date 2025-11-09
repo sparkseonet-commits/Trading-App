@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-slate-100 text-slate-900 antialiased;
+}
+
+a {
+  @apply text-blue-600 hover:underline;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  @apply bg-black;
+}
+
+input[type="range"]::-moz-range-thumb {
+  @apply bg-black;
+}
