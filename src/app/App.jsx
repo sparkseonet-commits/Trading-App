@@ -26,24 +26,33 @@ import {
  */
 
 // ---------------- Types ----------------
-type Row = {
-  date: string | number;
-  open: number; high: number; low: number; close: number; volume: number; mvrvz?: number;
-};
+/**
+ * @typedef {Object} Row
+ * @property {string|number} date
+ * @property {number} open
+ * @property {number} high
+ * @property {number} low
+ * @property {number} close
+ * @property {number} volume
+ * @property {number | undefined} [mvrvz]
+ */
 
-type ParsedRow = Row & { ts: number; dateISO: string };
+/** @typedef {Row & { ts:number, dateISO:string }} ParsedRow */
 
-type Weights = {
-  bollinger: number;
-  macd: number;
-  vsa: number;
-  smaStack: number;
-  prevLowUp: number;
-  rsi10: number; rsi20: number; rsi30: number;
-  piDeep: number; // experimental: PI < 0.125 strong buy
-};
+/**
+ * @typedef {Object} Weights
+ * @property {number} bollinger
+ * @property {number} macd
+ * @property {number} vsa
+ * @property {number} smaStack
+ * @property {number} prevLowUp
+ * @property {number} rsi10
+ * @property {number} rsi20
+ * @property {number} rsi30
+ * @property {number} piDeep
+ */
 
-const DEFAULT_WEIGHTS: Weights = {
+const DEFAULT_WEIGHTS = {
   bollinger: 1.0,
   macd: 1.0,
   vsa: 1.0,
@@ -62,26 +71,27 @@ const MS_PER_DAY = 86400000;
 const SYNC_ID = "sync-confidence";
 
 // ---------------- Epoch normalizer (handles s/ms/µs/ns) ----------------
-function normalizeEpochToMs(x: number | null | undefined): number | null {
+function normalizeEpochToMs(x) {
   if (x === null || x === undefined) return null;
-  if (!Number.isFinite(x as number)) return null;
-  const v = Math.abs(x as number);
-  if (v >= 1e18) return Math.trunc((x as number) / 1e6);  // nanoseconds → ms
-  if (v >= 1e15) return Math.trunc((x as number) / 1e3);  // microseconds → ms
-  if (v >= 1e12) return Math.trunc(x as number);          // milliseconds
-  if (v >= 1e10) return Math.trunc((x as number) * 1000); // seconds → ms
-  return Math.trunc(x as number);
+  const value = Number(x);
+  if (!Number.isFinite(value)) return null;
+  const v = Math.abs(value);
+  if (v >= 1e18) return Math.trunc(value / 1e6);  // nanoseconds → ms
+  if (v >= 1e15) return Math.trunc(value / 1e3);  // microseconds → ms
+  if (v >= 1e12) return Math.trunc(value);        // milliseconds
+  if (v >= 1e10) return Math.trunc(value * 1000); // seconds → ms
+  return Math.trunc(value);
 }
 
 // ---------------- Math utils ----------------
-const sma = (arr: number[], period: number): number[] => {
+const sma = (arr, period) => {
   const n = arr.length; const out = new Array(n).fill(NaN);
   if (period <= 1) return arr.slice();
   let acc = 0; for (let i=0;i<n;i++){ acc += arr[i]; if (i>=period) acc -= arr[i-period]; if (i>=period-1) out[i] = acc/period; }
   return out;
 };
 
-const ema = (arr: number[], period: number): number[] => {
+const ema = (arr, period) => {
   const n = arr.length; const out = new Array(n).fill(NaN);
   if (n===0) return out; if (period<=1) return arr.slice();
   const k = 2/(period+1);
@@ -91,7 +101,7 @@ const ema = (arr: number[], period: number): number[] => {
   return out;
 };
 
-const std = (arr: number[], period: number): number[] => {
+const std = (arr, period) => {
   const n = arr.length; const out = new Array(n).fill(NaN);
   const mean = sma(arr, period);
   for (let i=period-1;i<n;i++){
@@ -102,7 +112,7 @@ const std = (arr: number[], period: number): number[] => {
 };
 
 // Wilder RSI (14 by default)
-const rsi = (arr: number[], period: number): number[] => {
+const rsi = (arr, period) => {
   const n = arr.length; const out = new Array(n).fill(NaN);
   if (n < period + 1 || period < 2) return out;
   const deltas = new Array(n).fill(0);
@@ -126,14 +136,14 @@ const rsi = (arr: number[], period: number): number[] => {
   return out;
 };
 
-function macdLine(arr: number[], fast=12, slow=26, signal=9){
+function macdLine(arr, fast=12, slow=26, signal=9){
   const fastE = ema(arr, fast); const slowE = ema(arr, slow);
   const macd = fastE.map((v,i)=> v - slowE[i]);
   const sig = ema(macd, signal);
   return { macd, signal: sig };
 }
 
-function slope(arr: number[], window=10){
+function slope(arr, window=10){
   const n = arr.length; const out = new Array(n).fill(NaN);
   if (window<2) return out;
   for (let i=window-1;i<n;i++){
@@ -149,8 +159,8 @@ function slope(arr: number[], window=10){
 }
 
 // ---------------- VSA (simplified) ----------------
-function vsaSignals(open: number[], high: number[], low: number[], close: number[], volume: number[]){
-  const n = close.length; const out = { combined: new Array(n).fill(0) } as { combined: number[] };
+function vsaSignals(open, high, low, close, volume){
+  const n = close.length; const out = { combined: new Array(n).fill(0) };
   const volMA = sma(volume, 24); // 24h lookback
  // 20h proxy
   const volSD = std(volume, 24);
@@ -171,11 +181,11 @@ function vsaSignals(open: number[], high: number[], low: number[], close: number
 }
 
 // ---------------- Scoring (independent sliders) ----------------
-function scoreBar(i: number, ctx: any){
+function scoreBar(i, ctx){
   if (ctx.piBuy[i] || ctx.mvrvzBuy[i]) return { confidence: ABSOLUTE_CAP, parts: null };
-  const parts: Record<string, number> = {};
+  const parts = {};
   let raw=0, maxRaw=0;
-  const add = (k: string, active: boolean, w: number) => { const v = active? w: 0; raw += v; maxRaw += w; parts[k]=v; };
+  const add = (k, active, w) => { const v = active? w: 0; raw += v; maxRaw += w; parts[k]=v; };
 
   add("bollinger", ctx.touchLower[i], ctx.weights.bollinger);
   add("macd", ctx.macdCross[i], ctx.weights.macd);
@@ -199,27 +209,29 @@ function scoreBar(i: number, ctx: any){
 }
 
 // ---------------- 4h aggregation (OHLCV + last-known indicators) ----------------
-function aggregate4h(rows: ParsedRow[], extras: Record<string, number[]>)
-{
-  if (!rows.length) return [] as any[];
-  const FOUR_H = 4*60*60*1000; const out: any[]=[];
-  let bucket = Math.floor(rows[0].ts/FOUR_H)*FOUR_H; let cur: any | null = null;
+function aggregate4h(rows, extras){
+  if (!rows.length) return [];
+  const FOUR_H = 4*60*60*1000; const out = [];
+  let bucket = Math.floor(rows[0].ts/FOUR_H)*FOUR_H; let cur = null;
   const push = ()=>{ if (cur) out.push(cur); };
   for (let i=0;i<rows.length;i++){
     const r = rows[i]; const key = Math.floor(r.ts/FOUR_H)*FOUR_H;
     if (!cur || key!==bucket){ push(); bucket = key; cur = { ts:key, open:r.open, high:r.high, low:r.low, close:r.close, volume:r.volume };
     } else { cur.high=Math.max(cur.high,r.high); cur.low=Math.min(cur.low,r.low); cur.close=r.close; cur.volume += r.volume; }
-    for (const k of Object.keys(extras)) if (extras[k]) (cur as any)[k] = (extras as any)[k][i];
+    for (const k of Object.keys(extras)){
+      const series = extras[k];
+      if (Array.isArray(series)) cur[k] = series[i];
+    }
   }
   push();
   return out;
 }
 
 // ---------------- Daily resample (UTC) ----------------
-function resampleDaily(rows: ParsedRow[]){
-  if (!rows.length) return { daily: [] as any[], rowToDay: [] as number[] };
-  const daily: { ts:number, open:number, high:number, low:number, close:number }[] = [];
-  const rowToDay: number[] = new Array(rows.length).fill(0);
+function resampleDaily(rows){
+  if (!rows.length) return { daily: [], rowToDay: [] };
+  const daily = [];
+  const rowToDay = new Array(rows.length).fill(0);
   let currentKey = Math.floor(rows[0].ts / MS_PER_DAY) * MS_PER_DAY;
   let cur = { ts: currentKey, open: rows[0].open, high: rows[0].high, low: rows[0].low, close: rows[0].close };
   let dayIndex = 0;
@@ -239,23 +251,23 @@ function resampleDaily(rows: ParsedRow[]){
 }
 
 // ---------------- CSV Parsing (strict + normalized) ----------------
-function parseHeadered(data: any[]): ParsedRow[]{
-  const out: ParsedRow[]=[]; const MS_PER_DAY_LOCAL = 86400000; const excelToMs = (d:number)=> (d-25569)*MS_PER_DAY_LOCAL;
+function parseHeadered(data){
+  const out = []; const MS_PER_DAY_LOCAL = 86400000; const excelToMs = (d)=> (d-25569)*MS_PER_DAY_LOCAL;
 
-  const isISOish = (s: string) =>
+  const isISOish = (s) =>
     /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z)?)?$/i.test(s);
-  const isPureUnix = (s: string) =>
+  const isPureUnix = (s) =>
     /^\d{10}$/.test(s) || /^\d{13}$/.test(s) || /^\d{16,17}$/.test(s);
-  const isExcelSerial = (s: string) =>
+  const isExcelSerial = (s) =>
     /^\d{5,}(?:\.\d+)?(?:\s+\d{1,2}:\d{2}:\d{2})?$/.test(s);
 
   for (const d of data){
     if (!d || d.date===undefined || d.date===null || d.date==="") continue;
-    let ts: number | null = null;
+    let ts = null;
 
     if (typeof d.date === "number"){
       ts = normalizeEpochToMs(d.date);
-      if (ts && (d.date as number)>20000 && (d.date as number)<90000) ts = excelToMs(d.date as number);
+      if (ts && Number(d.date)>20000 && Number(d.date)<90000) ts = excelToMs(Number(d.date));
     } else if (typeof d.date === "string"){
       const s = d.date.trim();
       if (isISOish(s)){
@@ -283,16 +295,16 @@ function parseHeadered(data: any[]): ParsedRow[]{
   out.sort((a,b)=>a.ts-b.ts); return out;
 }
 
-function parseBinance(data: any[][]): ParsedRow[]{
-  const out: ParsedRow[]=[];
+function parseBinance(data){
+  const out = [];
   for (const row of data){
     if (!row || row.length<6) continue;
     const raw = Number(row[0]);
     const ms = normalizeEpochToMs(raw);
-    if (!Number.isFinite(ms as number)) continue;
+    if (!Number.isFinite(ms)) continue;
     out.push({
-      ts: ms as number,
-      dateISO: new Date(ms as number).toISOString(),
+      ts: ms,
+      dateISO: new Date(ms).toISOString(),
       open:+row[1], high:+row[2], low:+row[3], close:+row[4], volume:+row[5],
       date: raw
     });
@@ -302,36 +314,42 @@ function parseBinance(data: any[][]): ParsedRow[]{
 
 // ---------------- Component ----------------
 export default function App(){
-  const [rows,setRows] = useState<ParsedRow[]|null>(null);
+  const [rows,setRows] = useState(null);
   const [threshold,setThreshold] = useState(80);
   const [buyWindowHours,setBuyWindowHours] = useState(30*24);
   const [windowDays,setWindowDays] = useState(365); // default 12 months
   const [windowOffsetDays,setWindowOffsetDays] = useState(0); // 0 = end of series
-  const [weights,setWeights] = useState<Weights>({...DEFAULT_WEIGHTS});
-  const fileRef = useRef<HTMLInputElement>(null); const [fileName,setFileName] = useState("");
+  const [weights,setWeights] = useState({...DEFAULT_WEIGHTS});
+  const fileRef = useRef(null); const [fileName,setFileName] = useState("");
 
   // Independent sliders (no conservation)
-  const setWeight = (key: keyof Weights, value: number)=>{
-    const clamp = (x:number)=> Math.max(0, Math.min(5, x));
+  const setWeight = (key, value)=>{
+    const clamp = (x)=> {
+      const num = Number(x);
+      if (!Number.isFinite(num)) return 0;
+      return Math.max(0, Math.min(5, num));
+    };
     setWeights(w => ({...w, [key]: clamp(value)}));
   };
 
-  async function parseCSV(file: File){
+  async function parseCSV(file){
     if (!file) return;
     setFileName(file.name);
     const text = await file.text(); // Avoid Papa stream path (no File/Blob input)
     // First, parse as arrays (no header) to sniff Binance format
     const sniff = Papa.parse(text, { header:false, dynamicTyping:true, skipEmptyLines:true });
-    const first = (sniff.data as any[])[0];
+    const sniffData = Array.isArray(sniff.data) ? sniff.data : [];
+    const first = sniffData[0];
     if (Array.isArray(first) && first.length>=6 && Number.isFinite(Number(first[0]))){
       // Treat as Binance CSV (array rows)
-      const asArrays = sniff.data as any[][];
+      const asArrays = sniffData;
       setRows(parseBinance(asArrays));
       return;
     }
     // Else, parse as headered objects
     const parsed = Papa.parse(text, { header:true, dynamicTyping:true, skipEmptyLines:true });
-    setRows(parseHeadered(parsed.data as any[]));
+    const parsedData = Array.isArray(parsed.data) ? parsed.data : [];
+    setRows(parseHeadered(parsedData));
   }
 
   // ---------------- Compute (full history first, then slice) ----------------
@@ -381,7 +399,7 @@ export default function App(){
     const dPrev30LowUp = dTouchPrev30.map((t,i)=> t && up90[i]);
 
     // --- Expand daily arrays to row resolution ---
-    const expand = (arr:number[]) => rows.map((_,i)=> arr[rowToDay[i]]);
+    const expand = (arr) => rows.map((_,i)=> arr[rowToDay[i]]);
 
     const piBuy      = expand(dPiBuy);
     const piRatioRow = expand(dPiRatio);
@@ -428,11 +446,11 @@ export default function App(){
     };
 
     // Confidence & parts
-    const confidence = new Array(n).fill(0) as number[]; const partsArr = new Array(n).fill(null) as any[];
+    const confidence = new Array(n).fill(0); const partsArr = new Array(n).fill(null);
     for (let i=0;i<n;i++){ const { confidence:c, parts } = scoreBar(i, ctx); confidence[i]=c; partsArr[i]=parts; }
 
     // Buys with cooldown (first cross-up) (should not shift domain)
-    const cooldownMs = buyWindowHours*60*60*1000; const buys: any[]=[]; let lastBuyTs = -Infinity;
+    const cooldownMs = buyWindowHours*60*60*1000; const buys = []; let lastBuyTs = -Infinity;
     for (let i=1;i<n;i++){
       const ts = visRows[i].ts; const cross = confidence[i]>=threshold && confidence[i-1]<threshold; if (cross && ts-lastBuyTs>=cooldownMs){ buys.push({ index:i, ts, conf: confidence[i], parts: partsArr[i] }); lastBuyTs = ts; }
     }
@@ -445,12 +463,35 @@ export default function App(){
   }, [rows, windowDays, windowOffsetDays, threshold, buyWindowHours, weights]);
 
   const buyLines4h = useMemo(()=>{
-    if (!computed) return [] as number[]; const FOUR_H = 4*60*60*1000; return computed.buys.map(b=> Math.floor(b.ts/FOUR_H)*FOUR_H);
+    if (!computed || !Array.isArray(computed.buys)) return [];
+    const FOUR_H = 4*60*60*1000;
+    return computed.buys.map(b=> Math.floor(b.ts/FOUR_H)*FOUR_H);
   }, [computed]);
 
   // ---------------- UI helpers ----------------
-  const formatDateShort = (ts:number)=>{ const d = new Date(ts); const y=d.getUTCFullYear(); const m=String(d.getUTCMonth()+1).padStart(2,'0'); const day=String(d.getUTCDate()).padStart(2,'0'); return `${y}-${m}-${day}`; };
-  const formatDate = (ts:number)=> new Date(ts).toISOString().slice(0,16).replace("T"," ");
+  const coerceMs = (value)=> {
+    const ms = normalizeEpochToMs(value);
+    return Number.isFinite(ms) ? ms : null;
+  };
+  const formatDateShort = (ts)=>{
+    const ms = coerceMs(ts);
+    if (ms === null) return "";
+    const d = new Date(ms);
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth()+1).padStart(2,'0');
+    const day = String(d.getUTCDate()).padStart(2,'0');
+    return `${y}-${m}-${day}`;
+  };
+  const formatDate = (ts)=>{
+    const ms = coerceMs(ts);
+    if (ms === null) return "";
+    return new Date(ms).toISOString().slice(0,16).replace("T"," ");
+  };
+  const formatTooltipLabel = (value)=>{
+    const ms = coerceMs(value);
+    if (ms === null) return "";
+    return new Date(ms).toISOString().replace("T"," ").slice(0,16);
+  };
 
   // Self-tests to catch regressions (acts as simple test cases)
   useEffect(()=>{
@@ -460,7 +501,7 @@ export default function App(){
       const _r = rsi(t,14); const _m = macdLine(t,12,26,9); if (!_r || !_m.macd || !_m.signal) throw new Error("Indicators failed");
       // Daily resample ordering
       const base = 1700000000000; // fixed epoch
-      const demo: ParsedRow[] = [0,1,2,3,4,5].map(h=> ({ ts: base + h*3600000, dateISO: new Date(base + h*3600000).toISOString(), open:1,high:1,low:1,close:1,volume:1, date: base + h*3600000 }));
+      const demo = [0,1,2,3,4,5].map(h=> ({ ts: base + h*3600000, dateISO: new Date(base + h*3600000).toISOString(), open:1,high:1,low:1,close:1,volume:1, date: base + h*3600000 }));
       const rd = resampleDaily(demo); if (!rd.daily.length) throw new Error("Daily resample produced 0 length");
       // Buy lines test: floor-to-4h aligns with domain
       const FOUR_H = 4*60*60*1000;
@@ -470,6 +511,9 @@ export default function App(){
   },[]);
 
   const hasData = !!computed && Array.isArray(computed.display4h) && computed.display4h.length>0;
+  const chartData = hasData ? computed.display4h : [];
+  const buysForTable = computed && Array.isArray(computed.buys) ? computed.buys : [];
+  const buyLinesClean = buyLines4h.filter((ts)=> Number.isFinite(ts));
 
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto">
@@ -506,19 +550,25 @@ export default function App(){
 
           <div className="p-4 rounded-2xl shadow bg-white/60 border">
             <h2 className="font-semibold mb-2">Weights</h2>
-            {(["bollinger","macd","vsa","smaStack","prevLowUp"] as (keyof Weights)[]).map(k=> (
-              <div key={k} className="mb-3">
-                <div className="flex justify-between text-sm"><span>{k}</span><span>{weights[k].toFixed(2)}</span></div>
-                <input type="range" min={0} max={5} step={0.05} value={weights[k]} onChange={(e)=>setWeight(k, parseFloat(e.target.value))} className="w-full"/>
-              </div>
-            ))}
+            {["bollinger","macd","vsa","smaStack","prevLowUp"].map((k)=> {
+              const value = Number(weights[k] ?? 0);
+              return (
+                <div key={k} className="mb-3">
+                  <div className="flex justify-between text-sm"><span>{k}</span><span>{value.toFixed(2)}</span></div>
+                  <input type="range" min={0} max={5} step={0.05} value={value} onChange={(e)=>setWeight(k, parseFloat(e.target.value))} className="w-full"/>
+                </div>
+              );
+            })}
             <div className="text-xs text-gray-600">RSI band weights</div>
-            {["rsi10","rsi20","rsi30"].map((k)=> (
-              <div key={k} className="mb-2">
-                <div className="flex justify-between text-sm"><span>{k}</span><span>{(weights as any)[k].toFixed(2)}</span></div>
-                <input type="range" min={0} max={5} step={0.05} value={(weights as any)[k]} onChange={(e)=>setWeight(k as keyof Weights, parseFloat(e.target.value))} className="w-full"/>
-              </div>
-            ))}
+            {["rsi10","rsi20","rsi30"].map((k)=> {
+              const value = Number(weights[k] ?? 0);
+              return (
+                <div key={k} className="mb-2">
+                  <div className="flex justify-between text-sm"><span>{k}</span><span>{value.toFixed(2)}</span></div>
+                  <input type="range" min={0} max={5} step={0.05} value={value} onChange={(e)=>setWeight(k, parseFloat(e.target.value))} className="w-full"/>
+                </div>
+              );
+            })}
             <div className="text-xs text-gray-600 mt-3">Experimental</div>
             <div className="mb-2">
               <div className="flex justify-between text-sm"><span>PI deep-buy (PI &lt; 0.125)</span><span>{weights.piDeep.toFixed(2)}</span></div>
@@ -535,19 +585,25 @@ export default function App(){
             {!hasData ? <div className="text-gray-500 text-sm">Upload data to see charts.</div> : (
               <div className="h-[480px]">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={computed!.display4h} margin={{top:10,right:20,left:10,bottom:10}} syncId={SYNC_ID}>
+                  <LineChart data={chartData} margin={{top:10,right:20,left:10,bottom:10}} syncId={SYNC_ID}>
                     <CartesianGrid strokeDasharray="3 3"/>
-                    <XAxis type="number" dataKey="ts" tickFormatter={(v)=>formatDateShort(v as number)} domain={["dataMin","dataMax"]} minTickGap={16}/>
+                    <XAxis type="number" dataKey="ts" tickFormatter={(v)=>formatDateShort(v)} domain={["dataMin","dataMax"]} minTickGap={16}/>
                     <YAxis yAxisId="price" domain={["auto","auto"]}/>
                     <YAxis yAxisId="pi" orientation="right" domain={[0,1]} tickFormatter={(v)=>Number(v).toFixed(2)} allowDecimals/>
-                    <Tooltip formatter={(v:any,n:string)=>[typeof v === "number" ? Number(v).toFixed(2) : v, n]} labelFormatter={(l)=>new Date(l as number).toISOString().replace("T"," ").slice(0,16)}/>
+                    <Tooltip
+                      formatter={(value,name)=>{
+                        const num = Number(value);
+                        return [Number.isFinite(num) ? num.toFixed(2) : value, name];
+                      }}
+                      labelFormatter={formatTooltipLabel}
+                    />
                     <Line yAxisId="price" type="monotone" dataKey="close" name="Close (4h)" dot={false} strokeWidth={2}/>
                     <Line yAxisId="price" type="monotone" dataKey="sma7" name="SMA 7d" dot={false} strokeDasharray="4 2"/>
                     <Line yAxisId="price" type="monotone" dataKey="sma30" name="SMA 30d" dot={false} strokeDasharray="3 3"/>
                     <Line yAxisId="price" type="monotone" dataKey="sma90" name="SMA 90d" dot={false} strokeDasharray="6 2"/>
                     <Line yAxisId="pi" type="monotone" dataKey="pi" name="PI (111/(2*350))" dot={false} strokeWidth={1.5} stroke="#ec4899"/>
                     <ReferenceLine yAxisId="pi" y={0.3} stroke="#ec4899" strokeDasharray="4 2" ifOverflow="clip" />
-                    {(buyLines4h as number[]).filter(ts=>Number.isFinite(ts)).map((ts,i)=>(
+                    {buyLinesClean.map((ts,i)=>(
                       <ReferenceLine key={i} xAxisId={0} x={ts} stroke="green" strokeDasharray="6 4" label={{value:"BUY",position:"top",fill:"green"}} ifOverflow="extendDomain"/>
                     ))}
                   </LineChart>
@@ -561,15 +617,21 @@ export default function App(){
               <h2 className="font-semibold mb-3">RSI (14d)</h2>
               <div className="h-[160px] mb-3">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={computed!.display4h} margin={{top:5,right:20,left:10,bottom:5}} syncId={SYNC_ID}>
+                  <LineChart data={chartData} margin={{top:5,right:20,left:10,bottom:5}} syncId={SYNC_ID}>
                     <CartesianGrid strokeDasharray="3 3"/>
-                    <XAxis type="number" dataKey="ts" tickFormatter={(v)=>formatDateShort(v as number)} domain={["dataMin","dataMax"]} minTickGap={16}/>
+                    <XAxis type="number" dataKey="ts" tickFormatter={(v)=>formatDateShort(v)} domain={["dataMin","dataMax"]} minTickGap={16}/>
                     <YAxis domain={[0,100]}/>
                     <ReferenceLine y={30} stroke="#9ca3af" strokeDasharray="3 3" ifOverflow="clip"/>
                     <ReferenceLine y={70} stroke="#9ca3af" strokeDasharray="3 3" ifOverflow="clip"/>
-                    <Tooltip formatter={(v:any)=>[typeof v === "number" ? Number(v).toFixed(2) : v,"RSI (14d)"]} labelFormatter={(l)=>new Date(l as number).toISOString().replace("T"," ").slice(0,16)}/>
+                    <Tooltip
+                      formatter={(value)=>{
+                        const num = Number(value);
+                        return [Number.isFinite(num) ? num.toFixed(2) : value, "RSI (14d)"];
+                      }}
+                      labelFormatter={formatTooltipLabel}
+                    />
                     <Line type="monotone" dataKey="rsi" name="RSI (14d)" dot={false} strokeWidth={1.5}/>
-                    {(buyLines4h as number[]).map((ts,i)=>(
+                    {buyLinesClean.map((ts,i)=>(
                       <ReferenceLine key={i} x={ts} stroke="green" strokeDasharray="6 4" ifOverflow="extendDomain"/>
                     ))}
                   </LineChart>
@@ -579,14 +641,14 @@ export default function App(){
               <h2 className="font-semibold mb-3">MACD (12/26/9 daily)</h2>
               <div className="h-[160px]">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={computed!.display4h} margin={{top:5,right:20,left:10,bottom:5}} syncId={SYNC_ID}>
+                  <LineChart data={chartData} margin={{top:5,right:20,left:10,bottom:5}} syncId={SYNC_ID}>
                     <CartesianGrid strokeDasharray="3 3"/>
-                    <XAxis type="number" dataKey="ts" tickFormatter={(v)=>formatDateShort(v as number)} domain={["dataMin","dataMax"]} minTickGap={16}/>
+                    <XAxis type="number" dataKey="ts" tickFormatter={(v)=>formatDateShort(v)} domain={["dataMin","dataMax"]} minTickGap={16}/>
                     <YAxis domain={["auto","auto"]}/>
-                    <Tooltip labelFormatter={(l)=>new Date(l as number).toISOString().replace("T"," ").slice(0,16)}/>
+                    <Tooltip labelFormatter={formatTooltipLabel}/>
                     <Line type="monotone" dataKey="macd" name="MACD" dot={false} strokeWidth={1.5}/>
                     <Line type="monotone" dataKey="macdSig" name="Signal" dot={false} strokeWidth={1.2} strokeDasharray="4 2"/>
-                    {(buyLines4h as number[]).map((ts,i)=>(
+                    {buyLinesClean.map((ts,i)=>(
                       <ReferenceLine key={i} x={ts} stroke="green" strokeDasharray="6 4" ifOverflow="extendDomain"/>
                     ))}
                   </LineChart>
@@ -604,14 +666,14 @@ export default function App(){
                     <tr className="text-left border-b"><th className="py-2 pr-4">Date (1h)</th><th className="py-2 pr-4">Confidence</th><th className="py-2 pr-4">Contributors</th></tr>
                   </thead>
                   <tbody>
-                    {computed!.buys.map((b: any, idx: number)=> (
+                    {buysForTable.map((b, idx)=> (
                       <tr key={idx} className="border-b hover:bg-gray-50">
                         <td className="py-2 pr-4 whitespace-nowrap">{formatDate(b.ts)}</td>
                         <td className="py-2 pr-4">{b.conf.toFixed(2)}</td>
                         <td className="py-2 pr-4">{b.parts ? (
                           <div className="flex flex-wrap gap-2">
-                            {Object.entries(b.parts).filter(([,v])=> (v as number)>0).map(([k,v])=> (
-                              <span key={k} className="px-2 py-1 rounded-full bg-green-100 text-green-700">{k}: {(v as number).toFixed(2)}</span>
+                            {Object.entries(b.parts).filter(([,v])=> Number(v)>0).map(([k,v])=> (
+                              <span key={k} className="px-2 py-1 rounded-full bg-green-100 text-green-700">{k}: {Number(v).toFixed(2)}</span>
                             ))}
                           </div>
                         ) : (
