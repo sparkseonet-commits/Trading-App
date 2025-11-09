@@ -11,23 +11,53 @@ function lcKeys(obj){
 }
 
 export function normalizeEpochToMs(x){
-  if (x == null || x === '') return NaN;
-  let v = +x;
-  if (!Number.isFinite(v)) {
-    // Try Date parse
-    const d = new Date(x);
-    return isNaN(d.getTime()) ? NaN : d.getTime();
+  if (x == null || x === "") return NaN;
+
+  if (typeof x === "number"){
+    if (!Number.isFinite(x)) return NaN;
+    const v = Math.abs(x);
+    if (v > 20000 && v < 90000){
+      const excel = (x - 25569) * 86400000;
+      if (Number.isFinite(excel)) return Math.trunc(excel);
+    }
+    if (v >= 1e18) return Math.trunc(x / 1e6);
+    if (v >= 1e15) return Math.trunc(x / 1e3);
+    if (v >= 1e12) return Math.trunc(x);
+    if (v >= 1e10) return Math.trunc(x * 1000);
+    return Math.trunc(x);
   }
-  // Excel serial (rough): days since 1899-12-30
-  if (v > 60 && v < 60000) {
-    const ms = (v - 25569) * 86400000;
-    if (ms > 0) return ms;
+
+  if (typeof x === "string"){
+    const s = x.trim();
+    if (s === "") return NaN;
+
+    const excelMatch = s.match(/^([0-9]{5,}(?:\.[0-9]+)?)(?:\s+(\d{1,2}):(\d{2}):(\d{2}))?$/);
+    if (excelMatch){
+      const serial = Number(excelMatch[1]);
+      if (Number.isFinite(serial)){
+        let base = normalizeEpochToMs(serial);
+        if (Number.isFinite(base) && excelMatch[2] !== undefined){
+          const hh = Number(excelMatch[2]);
+          const mm = Number(excelMatch[3]);
+          const ss = Number(excelMatch[4]);
+          base += ((hh * 60 + mm) * 60 + ss) * 1000;
+        }
+        if (Number.isFinite(base)) return base;
+      }
+    }
+
+    const asNum = Number(s);
+    if (Number.isFinite(asNum)) return normalizeEpochToMs(asNum);
+    const parsed = new Date(s).getTime();
+    return Number.isFinite(parsed) ? parsed : NaN;
   }
-  // seconds vs ms vs micro/nano
-  if (v < 1e11) return v * 1000;        // seconds
-  if (v < 1e13) return v;               // milliseconds
-  if (v < 1e16) return Math.floor(v / 1000); // microseconds
-  return Math.floor(v / 1e6);           // nanoseconds
+
+  if (x instanceof Date){
+    const t = x.getTime();
+    return Number.isFinite(t) ? t : NaN;
+  }
+
+  return NaN;
 }
 
 export function parseHeadered(data){
