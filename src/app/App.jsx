@@ -29,6 +29,7 @@ export default function App(){
   const [weights, setWeights] = useState(DEFAULT_WEIGHTS);
   const fileRef = useRef(null);
   const [fileName, setFileName] = useState("");
+  const [parseError, setParseError] = useState("");
 
   const setWeight = (key, value) => {
     const clamp = (x) => Math.max(0, Math.min(5, x));
@@ -38,19 +39,32 @@ export default function App(){
   const parseCSV = useCallback(async (file)=>{
     if (!file) return;
     setFileName(file.name);
+    setParseError("");
     try {
       const text = await file.text();
       const sniff = Papa.parse(text, { header: false, dynamicTyping: true, skipEmptyLines: true });
       const first = Array.isArray(sniff.data) ? sniff.data[0] : null;
       if (Array.isArray(first) && first.length >= 6 && Number.isFinite(Number(first[0]))){
-        setRows(parseBinance(sniff.data));
+        const parsedRows = parseBinance(sniff.data);
+        if (!parsedRows.length) {
+          throw new Error("No valid rows found in Binance format");
+        }
+        setRows(parsedRows);
         return;
       }
       const parsed = Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true });
-      setRows(parseHeadered(parsed.data));
+      if (parsed.errors && parsed.errors.length){
+        throw new Error(parsed.errors[0]?.message || "CSV parsing error");
+      }
+      const parsedRows = parseHeadered(parsed.data);
+      if (!parsedRows.length){
+        throw new Error("No valid rows found in CSV");
+      }
+      setRows(parsedRows);
     } catch (err) {
       console.error("Failed to parse CSV", err); // eslint-disable-line no-console
       setRows([]);
+      setParseError(err instanceof Error ? err.message : "Failed to parse CSV file");
     }
   }, []);
 
@@ -208,6 +222,12 @@ export default function App(){
           />
         </div>
       </header>
+
+      {parseError && (
+        <div className="text-sm text-red-700 bg-red-100 border border-red-200 rounded p-3">
+          Failed to load CSV: {parseError}
+        </div>
+      )}
 
       {computed && (
         <div className="text-xs text-gray-700 bg-yellow-50 border border-yellow-200 rounded p-2">
